@@ -1,0 +1,12 @@
+.git
+.pixi
+.claude
+.vscode
+.pytest_cache
+.ruff_cache
+__pycache__
+*.zip
+*.h5
+*.hdf5
+Pointwise-Energy PGD Transport Development Plan.md
+studies/*/results

@@ -1,0 +1,14 @@
+{
+  "name": "ZeroG",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspaces/zerog",
+  "postCreateCommand": "pixi install --locked",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "charliermarsh.ruff"]
+    }
+  }
+}
