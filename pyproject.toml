@@ -1,0 +1,56 @@
+[project]
+name = "zerog"
+version = "0.1.0"
+description = "Pointwise-energy PGD transport solver"
+readme = "README.md"
+authors = [
+    { name = "zachmprince", email = "zachmprince@gmail.com" }
+]
+requires-python = ">=3.13"
+# Dependencies are managed by pixi (conda-forge); see [tool.pixi.dependencies].
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.14"]
+build-backend = "uv_build"
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.dependencies]
+python = "3.13.*"  # openmc on conda-forge is built for 3.13
+openmc = "*"
+numpy = "*"
+scipy = "*"
+numba = "*"
+h5py = "*"
+meshio = "*"
+pytest = "*"
+ruff = "*"
+
+[tool.pixi.pypi-dependencies]
+zerog = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+test = "pytest"
+lint = "ruff check"
+fmt = "ruff format"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "B",        # bugbear
+    "UP",       # pyupgrade
+    "NPY",      # numpy-specific
+    "SIM",      # simplify
+    "C4",       # comprehensions
+    "RUF",      # ruff-specific
+    "PT",       # pytest style
+]

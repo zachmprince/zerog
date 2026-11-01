@@ -1,0 +1,17 @@
+.venv/
+.pixi/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+.vscode/
+
+# Nuclear data and large results stay out of git
+*.h5
+*.hdf5
+*.xml
+.env
