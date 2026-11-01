@@ -11,13 +11,13 @@ import pytest
 from zerog.data.interp import evaluate_tabulated
 from zerog.data.library import nuclide_path
 from zerog.data.neutron import (
-    MaxwellSpectrum,
     neutron_balance,
     read_fission,
     read_neutron,
     read_reactions,
     read_scattering_yields,
 )
+from zerog.data.scatter import MaxwellSpectrum
 
 RTOL = 1e-14
 NUCLIDES = [
@@ -218,15 +218,6 @@ def test_no_delayed_products_keeps_shape():
     assert np.any(f.nu_total > f.nu_prompt)
 
 
-@needs_library
-@pytest.mark.parametrize("name", ["Th232", "Pa231", "Pa233"])
-def test_unsupported_fission_forms_refuse_but_cross_sections_read(name):
-    data = read_neutron(name, "294K")
-    assert data.fission.any()
-    with pytest.raises(NotImplementedError):
-        read_fission(data)
-
-
 def test_interpolation_zero_value_matches_openmc():
     x = np.array([1.0, 2.0])
     y = np.array([0.0, 1.0])
@@ -318,8 +309,7 @@ def test_every_fissionable_nuclide_reads_or_refuses_by_name():
         assert reactions
         readable += 1
     assert readable + len(refused) == 88
-    assert sorted(refused) == ["Pa231", "Pa233", "Th232"]
-    assert all("correlated" in reason for reason in refused.values())
+    assert refused == {}
 
 
 @needs_library

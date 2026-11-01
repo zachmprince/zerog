@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ZeroG is a research code for a deterministic full-core neutron transport solver with **no multigroup library**. The angular flux is a PGD (proper generalized decomposition) expansion ψ(x,Ω,E) ≈ Σₘ Xₘ(x,Ω) εₘ(E), with the energy modes εₘ on a pointwise grid built directly from evaluated nuclear data. It starts with PWR benchmarks but must assume nothing LWR-specific (SFR cases are an early second target: no thermal spectrum, square lattices or water assumptions in core code).
 
-The repo is in Phase 0: `src/zerog/data/` holds the nuclear data readers and union grid, and the other subpackages are still empty. The development plan lives in `Pointwise-Energy PGD Transport Development Plan.md` in the repo root. It is deliberately **untracked and not in `.gitignore`**; never `git add -A` blindly, and never commit it.
+Phase 0 is closed (`docs/decisions/004-phase-0-close.md` lists the limits Phase 1 inherits): `src/zerog/data/` holds the nuclear data readers and union grid, and the other subpackages are still empty. The development plan lives in `Pointwise-Energy PGD Transport Development Plan.md` in the repo root. It is deliberately **untracked and not in `.gitignore`**; never `git add -A` blindly, and never commit it.
 
 ## Commands
 

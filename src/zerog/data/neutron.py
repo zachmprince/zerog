@@ -12,51 +12,18 @@ from numpy.polynomial.polynomial import polyval
 
 from zerog.data.interp import evaluate_tabulated
 from zerog.data.library import nuclide_path
+from zerog.data.scatter import (
+    CorrelatedLaw,
+    MaxwellSpectrum,
+    TabularSpectrum,
+    UncorrelatedLaw,
+    read_law,
+)
 
 MT_ELASTIC = 2
 MT_FISSION = 18
 MT_CAPTURE = 102
 MT_PARTIAL_FISSION = (19, 20, 21, 38)
-
-
-@dataclass(frozen=True)
-class TabularSpectrum:
-    """Outgoing-energy tables per incoming energy, in flat arrays.
-
-    Table i spans offsets[i]:offsets[i + 1] of energy_out, pdf and cdf, with interpolation[i] its
-    ENDF rule. Both incoming and outgoing energies run high to low. cdf keeps the library's meaning,
-    the probability of emission below that point, so it decreases along each table.
-
-    Flipping moves histogram (rule 1) values relative to their intervals: pdf[k + 1] applies between
-    energy_out[k] and energy_out[k + 1], and pdf[0] of each table is unused. Lin-lin tables are
-    unaffected.
-
-    The energy-grid interpolation regions are kept as stored, describing energy[::-1], which is also
-    the order evaluate_tabulated needs.
-    """
-
-    energy: np.ndarray
-    breakpoints_ascending: np.ndarray
-    interpolation_ascending: np.ndarray
-    offsets: np.ndarray
-    interpolation: np.ndarray
-    energy_out: np.ndarray
-    pdf: np.ndarray
-    cdf: np.ndarray
-
-
-@dataclass(frozen=True)
-class MaxwellSpectrum:
-    """Maxwell spectrum sqrt(E') exp(-E' / theta(E)), normalized over 0 <= E' <= E - u.
-
-    energy and theta run high to low, with interpolation regions describing energy[::-1].
-    """
-
-    energy: np.ndarray
-    theta: np.ndarray  # eV
-    breakpoints_ascending: np.ndarray
-    interpolation_ascending: np.ndarray
-    u: float  # eV, restriction energy, which can be negative
 
 
 @dataclass(frozen=True)
@@ -73,6 +40,9 @@ class FissionData:
     nuclides have no delayed products at all, for which the gap reaches several percent. Partial
     reactions each repeat the same yields, so never sum them across reactions unweighted.
 
+    chi_prompt is a CorrelatedLaw for Th232, Pa231 and Pa233. Its table is then chi_prompt.spectrum,
+    and its anisotropic mu is in the lab frame, like every fission product in the library.
+
     With emission_mode 'total' the file does not separate prompt and delayed neutrons. nu_prompt and
     chi_prompt then hold all of them, and there are no delayed groups.
     """
@@ -84,7 +54,7 @@ class FissionData:
     nu_prompt: np.ndarray
     nu_delayed: np.ndarray  # (delayed groups, energies)
     decay_rate: np.ndarray  # per delayed group, 1/s
-    chi_prompt: TabularSpectrum | MaxwellSpectrum
+    chi_prompt: TabularSpectrum | MaxwellSpectrum | CorrelatedLaw
     chi_delayed: list[TabularSpectrum | MaxwellSpectrum]
 
 
@@ -141,48 +111,23 @@ def _read_spectrum(product):
     group = product["distribution_0"]
     if "applicability" in group and not np.all(group["applicability"][1, :] == 1.0):
         raise NotImplementedError("distribution with partial applicability")
-    if group.attrs["type"] != b"uncorrelated":
-        raise NotImplementedError(f"distribution of type {group.attrs['type'].decode()}")
-    energy_group = group["energy"]
-    if energy_group.attrs["type"] == b"maxwell":
-        theta = energy_group["theta"]
-        return MaxwellSpectrum(
-            energy=theta[()][0, ::-1].copy(),
-            theta=theta[()][1, ::-1].copy(),
-            breakpoints_ascending=theta.attrs["breakpoints"].astype(np.int64),
-            interpolation_ascending=theta.attrs["interpolation"].astype(np.int64),
-            u=float(energy_group.attrs["u"]),
-        )
-    if energy_group.attrs["type"] != b"continuous":
-        raise NotImplementedError(f"energy distribution {energy_group.attrs['type'].decode()}")
-
-    tables = energy_group["distribution"]
-    if np.any(tables.attrs["n_discrete_lines"] != 0):
-        raise NotImplementedError("spectrum with discrete lines")
-    data = tables[()]
-    starts = tables.attrs["offsets"].astype(np.int64)
-    ends = np.append(starts[1:], data.shape[1])
-    lengths = (ends - starts)[::-1]
-    order = np.concatenate([np.arange(a, b)[::-1] for a, b in zip(starts, ends, strict=True)][::-1])
-
-    regions = energy_group["energy"].attrs["interpolation"]
-    return TabularSpectrum(
-        energy=energy_group["energy"][()][::-1].copy(),
-        breakpoints_ascending=regions[0, :].astype(np.int64),
-        interpolation_ascending=regions[1, :].astype(np.int64),
-        offsets=np.concatenate([[0], np.cumsum(lengths)]),
-        interpolation=tables.attrs["interpolation"][::-1].astype(np.int64),
-        energy_out=data[0, order],
-        pdf=data[1, order],
-        cdf=data[2, order],
-    )
+    law = read_law(group)
+    if isinstance(law, UncorrelatedLaw):
+        spectrum = law.energy
+    elif isinstance(law, CorrelatedLaw):
+        return law
+    else:
+        raise NotImplementedError(f"fission spectrum of type {type(law).__name__}")
+    if not isinstance(spectrum, TabularSpectrum | MaxwellSpectrum):
+        raise NotImplementedError(f"fission spectrum of type {type(spectrum).__name__}")
+    return spectrum
 
 
 def read_fission(data):
     """Read each fission reaction of a NeutronData, as a list that is empty if it has none.
 
-    Raises NotImplementedError for forms not supported yet, so that cross sections stay readable for
-    those nuclides: correlated spectra.
+    Raises NotImplementedError for a form it does not support, so that cross sections stay readable
+    for that nuclide. Every fissionable nuclide in ENDF/B-VIII.0 is supported.
     """
     with h5py.File(nuclide_path(data.name), "r") as f:
         group = f[data.name]
