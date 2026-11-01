@@ -62,6 +62,14 @@ Per material, PWR pin, at 0.1%:
   per material. Spanning 600, 900 and 1200 K in the fuel and 294 and 600 K elsewhere raises this to
   442,276 and 667,594. A grid thinned at one temperature breaks tolerance at another, so a real
   temperature field needs the larger figure or more.
+- **Between tabulated temperatures:** with UO2 at 750 K and the rest at 565 K, a grid for exactly
+  those temperatures needs 317,138 points at 1% and 585,647 at 0.1%, close to the one-temperature
+  counts. Cross sections there are the per-lookup expected values of OpenMC's `interpolation` method,
+  linear in T between bounds, from `zerog.data.temperature`. This mix is not physical Doppler
+  broadening. For the mixed curves, each bound evaluated through its own thinned grid stays within
+  tolerance; exact mixed values at the merged grid's nodes can exceed it slightly (err/tol 1.18 on
+  U238 capture at 650 K). The review also measured OpenMC's first-flight rate moving towards the
+  harmonic mean in thick media, so twins should stay at tabulated temperatures for now.
 - **Comparison with the toy:** the toy needed 36,000-92,000 points, with one resonant nuclide and an
   upper limit of 5 keV. Only the 1% macroscopic grids fall in that range.
 - **Cladding:** for this fresh-fuel list, Zircaloy-4 needs more microscopic points than UO2, and 6.4
@@ -80,8 +88,8 @@ Not covered:
   1.06e-3 for Pu239 on a 0.1% grid.
 - PGD effective densities can be negative. The relative bound then fails through cancellation, and
   only an absolute one holds, so Phase 1 should measure error on actual effective densities.
-- S(α,β) grids, burned fuel and temperatures between tabulated points are not included, so these
-  figures are lower estimates for a real core. The thinning is greedy, so each is an upper bound on
+- S(α,β) grids, burned fuel and a continuous temperature field are not included, so these figures
+  are lower estimates for a real core. The thinning is greedy, so each is an upper bound on
   the smallest grid for its own curves, nuclides and temperatures only.
 - Above 20 MeV is cut. χ tails will need handling before this feeds a solver.
 

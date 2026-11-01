@@ -74,7 +74,11 @@ def thin_nuclide(name, temperature, rtol, atol, energy_max=2.0e7):
     non-negative sum of the reactions, such as the total, keeps the relative bound, plus atol per
     reaction. Each threshold point is kept, so that a reaction stays zero below its threshold.
     """
-    data = read_reactions(name, temperature)
+    return thin_reactions(read_reactions(name, temperature), rtol, atol, energy_max)
+
+
+def thin_reactions(data, rtol, atol, energy_max=2.0e7):
+    """The thinned grid of a ReactionCurves, as described in thin_nuclide."""
     start = np.searchsorted(-data.energy, -energy_max)
     energy = data.energy[start:]
     required = np.zeros(energy.shape[0], dtype=np.bool_)

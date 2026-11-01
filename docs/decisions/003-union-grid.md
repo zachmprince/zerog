@@ -21,8 +21,12 @@ and 165,509 points. The toy used 36,000-92,000.
 ## Consequences
 
 - Estimate energy-solve cost, and the effective cross-section cost in Phase 3's gate, with this N_E
-  and not the toy's. These figures are lower estimates for a real core: S(α,β), burned fuel and
-  temperatures between tabulated points are not included.
+  and not the toy's. These figures are lower estimates for a real core: S(α,β), burned fuel and a
+  continuous temperature field are not included.
+- OpenMC twins should run at tabulated temperatures until a slowing-down comparison measures the
+  effect of its statistical interpolation. Its first-flight rate moves from the arithmetic towards
+  the harmonic mean of the bounds as flights thicken, so linear curves are not its reaction rate.
+  Phase 3 still needs its own temperature treatment, because the mix is not Doppler broadening.
 - Density-weighted thinning and lumping trace isotopes are worth testing in Phase 1. Both would tie
   the grid to a composition range, so burnup needs care.
 - Effective densities in PGD can be negative, which removes the relative bound on a sum. Phase 1

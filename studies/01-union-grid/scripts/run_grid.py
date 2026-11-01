@@ -6,8 +6,15 @@ from pathlib import Path
 import numpy as np
 from openmc.data import NATURAL_ABUNDANCE
 
-from zerog.data.grid import major_curves, thin_indices, thin_nuclide, union_grid
+from zerog.data.grid import (
+    major_curves,
+    thin_indices,
+    thin_nuclide,
+    thin_reactions,
+    union_grid,
+)
 from zerog.data.neutron import read_reactions
+from zerog.data.temperature import read_reactions_at
 
 RESULTS = Path(__file__).resolve().parent.parent / "results"
 ENERGY_MAX = 2.0e7
@@ -89,6 +96,8 @@ CASES = {
 # Tabulated temperatures a real pin's fuel, or its cladding and coolant, would span.
 PWR_SPANS = {"UO2": ("600K", "900K", "1200K"), "Zircaloy-4": ("294K", "600K")}
 PWR_SPANS["Borated water"] = ("294K", "600K")
+# Kelvin, between tabulated temperatures, so each nuclide's grid merges two library grids.
+INTERMEDIATE = {"UO2": 750.0, "Zircaloy-4": 565.0, "Borated water": 565.0}
 
 
 def on_energy(data, curves, energy):
@@ -190,6 +199,16 @@ def main():
         n = len(union_grid(spanned))
         rows.append(("PWR pin, temperature span", "all", "all reactions", rtol, n))
         print(f"PWR pin, temperature span rtol={rtol:g}: {n}")
+
+    for rtol in TOLERANCES[:2]:
+        grids = [
+            thin_reactions(read_reactions_at(n, INTERMEDIATE[material]), rtol, ATOL_MICRO)
+            for material, _, densities in CASES["PWR pin"]
+            for n in densities
+        ]
+        n = len(union_grid(grids))
+        rows.append(("PWR pin, intermediate temperatures", "all", "all reactions", rtol, n))
+        print(f"PWR pin, intermediate temperatures rtol={rtol:g}: {n}")
 
     for case, materials in CASES.items():
         for atol in ATOL_SENSITIVITY:
