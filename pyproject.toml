@@ -28,6 +28,7 @@ h5py = "*"
 meshio = "*"
 pytest = "*"
 ruff = "*"
+matplotlib = ">=3.11.2,<4"
 
 [tool.pixi.pypi-dependencies]
 zerog = { path = ".", editable = true }
@@ -54,3 +55,7 @@ select = [
     "RUF",      # ruff-specific
     "PT",       # pytest style
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# Ported toy, kept close to its original form; new code should not need these.
+"studies/00-toy-rank/scripts/*" = ["B007", "B905", "C408", "E741", "RUF001", "RUF007"]
