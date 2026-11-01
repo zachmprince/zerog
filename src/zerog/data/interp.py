@@ -14,6 +14,8 @@ def evaluate_tabulated(x, y, breakpoints, interpolation, query):
     interpolation region, and interpolation its ENDF rule: 1 histogram, 2 lin-lin, 3 lin-log,
     4 log-lin, 5 log-log.
     """
+    if x[0] > x[-1]:
+        raise ValueError("x must be ascending")
     out = np.empty(query.shape[0])
     for n in range(query.shape[0]):
         q = query[n]
@@ -25,7 +27,7 @@ def evaluate_tabulated(x, y, breakpoints, interpolation, query):
             continue
         i = np.searchsorted(x, q, side="right") - 1
         region = 0
-        while i >= breakpoints[region] - 1:
+        while region < breakpoints.shape[0] - 1 and i >= breakpoints[region] - 1:
             region += 1
         rule = interpolation[region]
         if rule == 1:

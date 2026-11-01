@@ -3,9 +3,13 @@
 import numpy as np
 from numba import njit
 
-from zerog.data.neutron import MT_CAPTURE, MT_ELASTIC, MT_FISSION, read_reactions
-
-MT_PARTIAL_FISSION = (19, 20, 21, 38)
+from zerog.data.neutron import (
+    MT_CAPTURE,
+    MT_ELASTIC,
+    MT_FISSION,
+    MT_PARTIAL_FISSION,
+    read_reactions,
+)
 
 
 @njit(cache=True)

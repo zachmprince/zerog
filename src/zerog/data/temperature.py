@@ -84,5 +84,6 @@ def read_reactions_at(name, temperature, tolerance=10.0):
         energy=energy[::-1],
         mt=lower.mt,
         threshold=np.minimum(lower.threshold, upper.threshold),
+        q=lower.q,
         xs=xs[:, ::-1],
     )

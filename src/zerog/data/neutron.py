@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import h5py
 import numpy as np
+from numpy.polynomial.polynomial import polyval
 
 from zerog.data.interp import evaluate_tabulated
 from zerog.data.library import nuclide_path
@@ -15,6 +16,7 @@ from zerog.data.library import nuclide_path
 MT_ELASTIC = 2
 MT_FISSION = 18
 MT_CAPTURE = 102
+MT_PARTIAL_FISSION = (19, 20, 21, 38)
 
 
 @dataclass(frozen=True)
@@ -44,20 +46,46 @@ class TabularSpectrum:
 
 
 @dataclass(frozen=True)
-class FissionData:
-    """Neutron yields on the nuclide's energy grid, and fission spectra.
+class MaxwellSpectrum:
+    """Maxwell spectrum sqrt(E') exp(-E' / theta(E)), normalized over 0 <= E' <= E - u.
 
-    Production must use nu_total. nu_prompt plus nu_delayed does not close to it: the evaluations
-    differ slightly, and some nuclides have no delayed products at all, for which the gap reaches
-    several percent.
+    energy and theta run high to low, with interpolation regions describing energy[::-1].
     """
 
+    energy: np.ndarray
+    theta: np.ndarray  # eV
+    breakpoints_ascending: np.ndarray
+    interpolation_ascending: np.ndarray
+    u: float  # eV, restriction energy, which can be negative
+
+
+@dataclass(frozen=True)
+class FissionData:
+    """One fission reaction: MT 18, or one of the partial reactions that replace it.
+
+    Yields are on the nuclide's energy grid. A nuclide's production spectrum sums over its
+    reactions, each with its own spectra:
+
+        xs * [(nu_total - sum(nu_delayed)) * chi_prompt + sum(nu_delayed * chi_delayed)]
+
+    Use that prompt weight, not nu_prompt. nu_total is the nuclide's, not this reaction's, and
+    nu_prompt plus nu_delayed does not close to it: the evaluations differ slightly, and some
+    nuclides have no delayed products at all, for which the gap reaches several percent. Partial
+    reactions each repeat the same yields, so never sum them across reactions unweighted.
+
+    With emission_mode 'total' the file does not separate prompt and delayed neutrons. nu_prompt and
+    chi_prompt then hold all of them, and there are no delayed groups.
+    """
+
+    mt: int
+    xs: np.ndarray
+    emission_mode: str  # 'prompt' or 'total'
     nu_total: np.ndarray
     nu_prompt: np.ndarray
     nu_delayed: np.ndarray  # (delayed groups, energies)
     decay_rate: np.ndarray  # per delayed group, 1/s
-    chi_prompt: TabularSpectrum
-    chi_delayed: list[TabularSpectrum]
+    chi_prompt: TabularSpectrum | MaxwellSpectrum
+    chi_delayed: list[TabularSpectrum | MaxwellSpectrum]
 
 
 @dataclass(frozen=True)
@@ -87,6 +115,7 @@ class ReactionCurves:
     energy: np.ndarray
     mt: np.ndarray
     threshold: np.ndarray  # eV, per reaction
+    q: np.ndarray  # eV, per reaction
     xs: np.ndarray  # (reactions, energies), zero below threshold
 
 
@@ -100,6 +129,8 @@ def _read_yield(dataset, energy):
             dataset.attrs["interpolation"].astype(np.int64),
             energy,
         )
+    if kind == "Polynomial":
+        return polyval(energy, dataset[()])
     raise NotImplementedError(f"yield of type {kind}")
 
 
@@ -113,6 +144,15 @@ def _read_spectrum(product):
     if group.attrs["type"] != b"uncorrelated":
         raise NotImplementedError(f"distribution of type {group.attrs['type'].decode()}")
     energy_group = group["energy"]
+    if energy_group.attrs["type"] == b"maxwell":
+        theta = energy_group["theta"]
+        return MaxwellSpectrum(
+            energy=theta[()][0, ::-1].copy(),
+            theta=theta[()][1, ::-1].copy(),
+            breakpoints_ascending=theta.attrs["breakpoints"].astype(np.int64),
+            interpolation_ascending=theta.attrs["interpolation"].astype(np.int64),
+            u=float(energy_group.attrs["u"]),
+        )
     if energy_group.attrs["type"] != b"continuous":
         raise NotImplementedError(f"energy distribution {energy_group.attrs['type'].decode()}")
 
@@ -139,47 +179,62 @@ def _read_spectrum(product):
 
 
 def read_fission(data):
-    """Read yields and spectra for a NeutronData, or None if it has no fission reaction.
+    """Read each fission reaction of a NeutronData, as a list that is empty if it has none.
 
     Raises NotImplementedError for forms not supported yet, so that cross sections stay readable for
-    those nuclides: Maxwell and correlated spectra, neutrons held only in the partial fission
-    reactions (MT 19, 20, 21, 38), and emission mode 'total'.
+    those nuclides: correlated spectra.
     """
     with h5py.File(nuclide_path(data.name), "r") as f:
         group = f[data.name]
-        key = f"reaction_{MT_FISSION:03d}"
-        if key not in group["reactions"]:
-            return None
-        fission = group["reactions"][key]
+        out = []
+        for rx in group["reactions"].values():
+            mt = int(rx.attrs["mt"])
+            if mt in (MT_FISSION, *MT_PARTIAL_FISSION) and not rx.attrs["redundant"]:
+                out.append(_read_fission_reaction(group, rx, mt, data))
+        return sorted(out, key=lambda reaction: reaction.mt)
 
-        prompt = None
-        delayed = []
-        product_keys = (k for k in fission if k.startswith("product_"))
-        for product_key in sorted(product_keys, key=lambda k: int(k[8:])):
-            product = fission[product_key]
-            if product.attrs["particle"] != b"neutron":
-                continue
-            mode = product.attrs["emission_mode"]
-            if mode == b"prompt":
-                prompt = product
-            elif mode == b"delayed":
-                delayed.append(product)
-            else:
-                raise NotImplementedError(f"fission neutrons with emission mode {mode.decode()}")
-        if prompt is None:
-            raise NotImplementedError(f"{data.name} has no prompt neutrons in MT {MT_FISSION}")
 
-        nu_delayed = np.empty((len(delayed), data.energy.shape[0]))
-        for g, product in enumerate(delayed):
-            nu_delayed[g] = _read_yield(product["yield"], data.energy)
-        return FissionData(
-            nu_total=_read_yield(group["total_nu"]["yield"], data.energy),
-            nu_prompt=_read_yield(prompt["yield"], data.energy),
-            nu_delayed=nu_delayed,
-            decay_rate=np.array([p.attrs["decay_rate"] for p in delayed]),
-            chi_prompt=_read_spectrum(prompt),
-            chi_delayed=[_read_spectrum(p) for p in delayed],
-        )
+def _read_fission_reaction(group, rx, mt, data):
+    leading = None
+    delayed = []
+    product_keys = (k for k in rx if k.startswith("product_"))
+    for product_key in sorted(product_keys, key=lambda k: int(k[8:])):
+        product = rx[product_key]
+        if product.attrs["particle"] != b"neutron":
+            continue
+        mode = product.attrs["emission_mode"]
+        if mode in (b"prompt", b"total"):
+            leading = product
+        elif mode == b"delayed":
+            delayed.append(product)
+        else:
+            raise NotImplementedError(f"fission neutrons with emission mode {mode.decode()}")
+    if leading is None:
+        raise NotImplementedError(f"{data.name} has no prompt neutrons in MT {mt}")
+
+    n = data.energy.shape[0]
+    dataset = rx[data.temperature]["xs"]
+    xs = np.zeros(n)
+    xs[dataset.attrs["threshold_idx"] :] = dataset[()]
+    nu_leading = _read_yield(leading["yield"], data.energy)
+    nu_delayed = np.empty((len(delayed), n))
+    for g, product in enumerate(delayed):
+        nu_delayed[g] = _read_yield(product["yield"], data.energy)
+    return FissionData(
+        mt=mt,
+        xs=xs[::-1].copy(),
+        emission_mode=leading.attrs["emission_mode"].decode(),
+        nu_total=(
+            _read_yield(group["total_nu"]["yield"], data.energy)
+            if "total_nu" in group
+            else nu_leading
+        ),
+        nu_prompt=nu_leading,
+        nu_delayed=nu_delayed,
+        decay_rate=np.array([p.attrs["decay_rate"] for p in delayed]),
+        chi_prompt=_read_spectrum(leading),
+        chi_delayed=[_read_spectrum(p) for p in delayed],
+    )
 
 
 def read_reactions(name, temperature):
@@ -196,6 +251,7 @@ def read_reactions(name, temperature):
         n = energy_ascending.shape[0]
         mts = []
         thresholds = []
+        qs = []
         curves = []
         for rx in group["reactions"].values():
             if rx.attrs["redundant"] or "xs" not in rx[temperature]:
@@ -206,14 +262,48 @@ def read_reactions(name, temperature):
             xs[threshold:] = dataset[()]
             mts.append(int(rx.attrs["mt"]))
             thresholds.append(energy_ascending[threshold])
+            qs.append(float(rx.attrs["Q_value"]))
             curves.append(xs[::-1])
 
         return ReactionCurves(
             energy=energy_ascending[::-1].copy(),
             mt=np.array(mts, dtype=np.int64),
             threshold=np.array(thresholds),
+            q=np.array(qs),
             xs=np.array(curves),
         )
+
+
+def read_scattering_yields(name, mts, energy):
+    """Neutrons emitted per reaction, as (reactions, energies); zero for fission reactions.
+
+    Fission neutrons are in read_fission. A reaction with zero yield removes the neutron. Only MT 5
+    has a yield that varies with energy, and a thinned grid does not certify it, or nu.
+    """
+    out = np.zeros((len(mts), energy.shape[0]))
+    with h5py.File(nuclide_path(name), "r") as f:
+        for r, mt in enumerate(mts):
+            if mt in (MT_FISSION, *MT_PARTIAL_FISSION):
+                continue
+            rx = f[name]["reactions"][f"reaction_{int(mt):03d}"]
+            for key in rx:
+                if key.startswith("product_") and rx[key].attrs["particle"] == b"neutron":
+                    out[r] += _read_yield(rx[key]["yield"], energy)
+    return out
+
+
+def neutron_balance(data, yields):
+    """Split a ReactionCurves total for particle balance, each (energies).
+
+    Returns scattering production, the sum of yield * xs over non-fission reactions; the fission
+    cross section; and net loss, the total less both. Net loss is what a balance needs: it counts
+    each reaction by its yield, so it can go negative where (n,xn) dominates, and it handles MT 5,
+    whose yield is fractional and depends on energy. It is not a sum of whole reactions.
+    """
+    is_fission = np.isin(data.mt, (MT_FISSION, *MT_PARTIAL_FISSION))
+    production = (data.xs * yields)[~is_fission].sum(axis=0)
+    fission = data.xs[is_fission].sum(axis=0)
+    return production, fission, data.xs.sum(axis=0) - production - fission
 
 
 def read_neutron(name, temperature):
