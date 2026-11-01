@@ -80,6 +80,16 @@ class NeutronData:
     fission: np.ndarray
 
 
+@dataclass(frozen=True)
+class ReactionCurves:
+    """Non-redundant reaction cross sections of one nuclide, which sum to its total."""
+
+    energy: np.ndarray
+    mt: np.ndarray
+    threshold: np.ndarray  # eV, per reaction
+    xs: np.ndarray  # (reactions, energies), zero below threshold
+
+
 def _read_yield(dataset, energy):
     kind = dataset.attrs["type"].decode()
     if kind == "Tabulated1D":
@@ -169,6 +179,40 @@ def read_fission(data):
             decay_rate=np.array([p.attrs["decay_rate"] for p in delayed]),
             chi_prompt=_read_spectrum(prompt),
             chi_delayed=[_read_spectrum(p) for p in delayed],
+        )
+
+
+def read_reactions(name, temperature):
+    """Read every non-redundant reaction with a cross section at a library temperature."""
+    if temperature == "0K":
+        raise ValueError("0K holds only elastic scattering, so it has no complete cross sections")
+
+    with h5py.File(nuclide_path(name), "r") as f:
+        group = f[name]
+        if temperature not in group["kTs"]:
+            raise KeyError(f"{name} has no data at {temperature}: {sorted(group['kTs'])}")
+
+        energy_ascending = group["energy"][temperature][()]
+        n = energy_ascending.shape[0]
+        mts = []
+        thresholds = []
+        curves = []
+        for rx in group["reactions"].values():
+            if rx.attrs["redundant"] or "xs" not in rx[temperature]:
+                continue
+            dataset = rx[temperature]["xs"]
+            threshold = dataset.attrs["threshold_idx"]
+            xs = np.zeros(n)
+            xs[threshold:] = dataset[()]
+            mts.append(int(rx.attrs["mt"]))
+            thresholds.append(energy_ascending[threshold])
+            curves.append(xs[::-1])
+
+        return ReactionCurves(
+            energy=energy_ascending[::-1].copy(),
+            mt=np.array(mts, dtype=np.int64),
+            threshold=np.array(thresholds),
+            xs=np.array(curves),
         )
 
 
