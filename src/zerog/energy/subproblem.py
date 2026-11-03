@@ -6,7 +6,7 @@ Y[t, l] is the emission density per unit lethargy of term t and Legendre order l
 per unit lethargy as well. Densities and the streaming coefficient a can be negative. The equation
 is collocated at the nodes, and the implicit part of each node's own panel moves to the left.
 
-Only order 0 of isotropic elastic scattering exists so far.
+Only order 0 of target-at-rest elastic scattering exists so far.
 """
 
 from dataclasses import dataclass
@@ -14,7 +14,13 @@ from dataclasses import dataclass
 import numpy as np
 from numba import njit
 
-from zerog.energy.elastic import window_widths
+from zerog.energy.elastic import (
+    WIDE_WINDOW,
+    AngleKernels,
+    anisotropic_correction,
+    compile_angle_tables,
+    window_widths,
+)
 from zerog.energy.grid import MAX_PANEL, emission_weights, rate_weights
 
 
@@ -28,6 +34,7 @@ class EnergyOperators:
     alpha: np.ndarray
     rate_weights: np.ndarray
     emission_weights: np.ndarray
+    angle: AngleKernels
 
 
 @dataclass(frozen=True)
@@ -42,8 +49,11 @@ class EnergySolution:
     diagonal: np.ndarray
 
 
-def build_operators(energy, removal, scatter, alpha):
-    """Check a grid against its terms, and collect the panel weights."""
+def build_operators(energy, removal, scatter, alpha, angle=None):
+    """Check a grid against its terms, and collect the panel weights.
+
+    angle is a list of AngleTables per term, with None for an isotropic one. None means all are.
+    """
     energy = np.asarray(energy, dtype=float)
     if np.any(np.diff(energy) >= 0.0):
         raise ValueError("energy must strictly decrease")
@@ -68,6 +78,7 @@ def build_operators(energy, removal, scatter, alpha):
         alpha=alpha,
         rate_weights=rate_weights(energy),
         emission_weights=emission_weights(energy),
+        angle=compile_angle_tables([None] * alpha.shape[0] if angle is None else angle),
     )
 
 
@@ -100,8 +111,27 @@ def _edge_integral(energy, sigma, flux, running, j, edge):
     return running[j] + total
 
 
-@njit(cache=True, error_model="numpy")
-def _march(energy, removal, scatter, alpha, weights, d_removal, d_scatter, streaming, source):
+# Not cached: Numba's cache does not notice changes to a callee in another file, so a cached caller
+# would keep running the old kernel.
+@njit(error_model="numpy")
+def _march(
+    energy,
+    removal,
+    scatter,
+    alpha,
+    weights,
+    d_removal,
+    d_scatter,
+    streaming,
+    source,
+    tables,
+    table_energy,
+    points,
+    mu,
+    pdf,
+    cutoff,
+    peak,
+):
     """Forward substitution over the nodes.
 
     Each term's running integral restarts once its block is a window wide. A window then spans at
@@ -116,6 +146,7 @@ def _march(energy, removal, scatter, alpha, weights, d_removal, d_scatter, strea
     pointer = np.zeros(n_terms, dtype=np.int64)
     block_start = np.zeros(n_terms, dtype=np.int64)
     previous_total = np.zeros(n_terms)
+    width = np.array([-np.log(a) if a > 0.0 else WIDE_WINDOW for a in alpha])
     for k in range(n):
         lhs = streaming
         rhs = source[k]
@@ -147,6 +178,31 @@ def _march(energy, removal, scatter, alpha, weights, d_removal, d_scatter, strea
                     window += -part if j >= block_start[t] else previous_total[t] - part
                 else:
                     window += previous_total[t]
+            if energy[pointer[t]] > cutoff[t]:
+                extra, extra_own, mean = anisotropic_correction(
+                    energy,
+                    k,
+                    sigma,
+                    flux,
+                    alpha[t],
+                    width[t],
+                    pointer[t],
+                    energy[k] / alpha[t] if alpha[t] > 0.0 else np.inf,
+                    cutoff[t],
+                    t,
+                    tables,
+                    table_energy,
+                    points,
+                    mu,
+                    pdf,
+                    peak,
+                )
+                window += extra
+                own += extra_own
+                if alpha[t] > 0.0 and energy[k] / alpha[t] < energy[0] and energy[k] > cutoff[t]:
+                    # The whole window is on the grid and above the cutoff, so this should vanish.
+                    # A window crossing either is truly cut short; see the kernel.
+                    own -= mean * sigma[k]
             lhs -= d_scatter[t] * factor * own
             rhs += d_scatter[t] * factor * window
             running[t, k] = known  # completed below, once F[k] is known
@@ -183,5 +239,12 @@ def solve_energy(ops, removal, scatter, streaming, source):
         scatter[:, 0],
         float(streaming),
         source,
+        ops.angle.tables,
+        ops.angle.table_energy,
+        ops.angle.points,
+        ops.angle.mu,
+        ops.angle.pdf,
+        ops.angle.cutoff,
+        ops.angle.peak,
     )
     return EnergySolution(flux, diagonal)

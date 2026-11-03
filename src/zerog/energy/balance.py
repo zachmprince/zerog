@@ -6,7 +6,10 @@ from dataclasses import dataclass
 import numpy as np
 from numba import njit
 
+from zerog.energy.elastic import angle_pdf
 from zerog.energy.grid import _GAUSS_S, _GAUSS_W, _weights, panel_rate
+
+BELOW_POINTS = 64  # midpoints across the cosines that land below the grid
 
 
 @dataclass(frozen=True)
@@ -25,7 +28,8 @@ class Balance:
     residual: float
 
 
-@njit(cache=True)
+# Not cached, as it calls across files: see zerog.energy.subproblem._march.
+@njit
 def _lost_below(energy, sigma, alpha, flux, nodes, node_weights):
     """Scattering from one term landing below the grid's bottom, target at rest and isotropic.
 
@@ -61,6 +65,44 @@ def _lost_below(energy, sigma, alpha, flux, nodes, node_weights):
     return total
 
 
+# Not cached, as it calls across files: see zerog.energy.subproblem._march.
+@njit
+def _lost_below_anisotropic(
+    energy, sigma, alpha, flux, cutoff, t, tables, table_energy, points, mu, pdf
+):
+    """The part of _lost_below from 2 f - 1, for incoming energies above the term's cutoff."""
+    bottom = energy[-1]
+    edge = bottom / alpha if alpha > 0.0 else np.inf
+    x_nodes = (0.1127016653792583, 0.5, 0.8872983346207417)
+    x_weights = (5.0 / 18.0, 8.0 / 18.0, 5.0 / 18.0)
+    total = 0.0
+    for i in range(energy.shape[0] - 1):
+        upper = energy[i]
+        lower = energy[i + 1]
+        if upper <= cutoff:
+            break
+        if lower >= edge:
+            continue
+        h = math.log(upper / lower)
+        first = math.log(upper / edge) if upper > edge else 0.0
+        for q in range(3):
+            s = first + x_nodes[q] * (h - first)
+            e = upper * math.exp(-s)
+            g = (upper - e) / (upper - lower)
+            r = s / h
+            rate = ((1.0 - g) * sigma[i] + g * sigma[i + 1]) * (
+                (1.0 - r) * flux[i] + r * flux[i + 1]
+            )
+            # The chance of landing below the bottom, less its isotropic value.
+            limit = (2.0 * bottom / e - 1.0 - alpha) / (1.0 - alpha)
+            below = 0.0
+            for m in range(BELOW_POINTS):
+                x = -1.0 + (m + 0.5) * (limit + 1.0) / BELOW_POINTS
+                below += angle_pdf(tables, table_energy, points, mu, pdf, t, e, x) - 0.5
+            total += x_weights[q] * (h - first) * rate * below * (limit + 1.0) / BELOW_POINTS
+    return total
+
+
 def energy_balance(ops, removal, scatter, streaming, source, flux):
     """Balance of a solve_energy result; arguments as there."""
     removal = np.asarray(removal, dtype=float)
@@ -76,4 +118,18 @@ def energy_balance(ops, removal, scatter, streaming, source, flux):
         lost += scatter[t, 0] * _lost_below(
             ops.energy, ops.scatter[t], ops.alpha[t], flux, _GAUSS_S, _GAUSS_W
         )
+        if np.isfinite(ops.angle.cutoff[t]):
+            lost += scatter[t, 0] * _lost_below_anisotropic(
+                ops.energy,
+                ops.scatter[t],
+                ops.alpha[t],
+                flux,
+                ops.angle.cutoff[t],
+                t,
+                ops.angle.tables,
+                ops.angle.table_energy,
+                ops.angle.points,
+                ops.angle.mu,
+                ops.angle.pdf,
+            )
     return Balance(src, emitted, removed, lost, src + emitted - removed - lost)

@@ -46,3 +46,15 @@ unknown, the quadrature and the signature that later kernels and Phase 4 depend 
 - Thresholds in `interpolate`d data need node pairs too. Their effect is not measured yet.
 - The edge integral costs several exponentials per term per node, so it is a first target for the
   speed gate.
+- **Anisotropic elastic scattering (M2)** adds 2f - 1 by direct sum to the isotropic recursion, down to
+  the energy where a term's tables are within 1e-3 of flat. Panels must resolve forward peaks, at
+  (peak of f) x h / window of 0.05 (`refine_for_angle`), which adds about 70,000 nodes for the SFR
+  and PWR nuclides sampled, mostly above 100 keV.
+- **Discrete normalization** is needed for this part, with f frozen at the node's energy, and only for
+  windows wholly above the anisotropy cutoff. Quadrature error acts as a net gain per collision that
+  compounds over lethargy.
+- **The direct sum misses the speed gate** by about 800 times in study 02 (7742 s at 544k nodes,
+  two terms), and cost grows with the square of the node count. It stays as the reference until M9 replaces it, which is now the phase's
+  largest technical risk.
+- **Numba's cache ignores callees in other files.** A cached kernel calling across modules keeps
+  running the old callee after an edit, so such callers must not use `cache=True`.

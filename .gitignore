@@ -16,3 +16,4 @@ dist/
 *.xml
 studies/*/results/
 .env
+benchmarks/*/results/
