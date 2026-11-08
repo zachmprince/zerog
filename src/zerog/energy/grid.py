@@ -71,6 +71,35 @@ def square_weights(energy):
     return _panel_weights(energy, 2, _GAUSS_S, _GAUSS_W)
 
 
+@njit(cache=True)
+def _centred_panel_weights(energy, power, nodes, node_weights):
+    """Panel weights with a factor (E_i / E - 1) ** power, taken as expm1 so small ones keep
+    their relative accuracy."""
+    n = energy.shape[0] - 1
+    out = np.empty((n, 4))
+    for i in range(n):
+        h = math.log(energy[i] / energy[i + 1])
+        denominator = math.expm1(-h)
+        w00 = w01 = w10 = w11 = 0.0
+        for q in range(nodes.shape[0]):
+            t = nodes[q]
+            s = t * h
+            g = math.expm1(-s) / denominator
+            v = node_weights[q] * h * math.expm1(s) ** power
+            w00 += v * (1.0 - g) * (1.0 - t)
+            w01 += v * (1.0 - g) * t
+            w10 += v * g * (1.0 - t)
+            w11 += v * g * t
+        out[i, 0], out[i, 1], out[i, 2], out[i, 3] = w00, w01, w10, w11
+    return out
+
+
+def centred_weights(energy):
+    """Weights of the integral of sigma(E) F(u) (E_i / E - 1) ** p du per panel, for p = 0, 1, 2,
+    as (3, panels, 4). These are the moments that zerog.energy.elastic's tree is built from."""
+    return np.stack([_centred_panel_weights(energy, p, _GAUSS_S, _GAUSS_W) for p in range(3)])
+
+
 def panel_rate(sigma, flux, weights):
     """The integral of sigma(E) F(u) du over the grid, from rate_weights."""
     return np.sum(

@@ -266,9 +266,69 @@ def test_every_emitting_hat_places_all_its_neutrons(name):
     fine = np.geomspace(14.0e6, 1.0e5, 401)
     coarse = coarse_grid(fine, 0.02, _thresholds([(name, "294K")], 14.0e6, 1.0e5))
     rows, lost, _, _ = term_transfer(name, "294K", awr(name), coarse, du=0.005, n_cosine=8)
-    emitting = rows.sum(axis=1) + lost > 0.0
+    sums = rows.sums()
+    emitting = sums + lost > 0.0
     assert emitting.sum() > 100
-    np.testing.assert_allclose(rows[emitting].sum(axis=1) + lost[emitting], 1.0, rtol=1e-12)
+    np.testing.assert_allclose(sums[emitting] + lost[emitting], 1.0, rtol=1e-12)
+
+
+def _transfer_oracle(name, awr, coarse, du, n_cosine):
+    """term_transfer's rows the plain way: every reaction's segment arrays, deposited densely."""
+    from zerog.data.neutron import read_reactions, read_scattering_yields
+    from zerog.energy.inelastic import _hat_moments, deposit
+
+    curves = read_reactions(name, "294K")
+    laws = [r for r in read_scattering_laws(name) if r.mt != 2]
+    mts = np.array([law.mt for law in laws], dtype=np.int64)
+    index = np.array([list(curves.mt).index(mt) for mt in mts])
+    produced = curves.xs[index] * read_scattering_yields(name, mts, curves.energy)
+    moments = [_hat_moments(coarse, curves.energy, curve) for curve in produced]
+    rows = np.zeros((coarse.shape[0], coarse.shape[0]))
+    lost = np.zeros(coarse.shape[0])
+    for j in range(coarse.shape[0]):
+        total = sum(m[0][j] for m in moments)
+        if total <= 0.0:
+            continue
+        for law, (integral, centroid) in zip(laws, moments, strict=True):
+            if integral[j] <= 0.0:
+                continue
+            share = integral[j] / total
+            lo, hi, w = reaction_points(law, centroid[j], awr, du, n_cosine)
+            if w.shape[0] == 0 and j > 0:
+                lo, hi, w = reaction_points(law, coarse[j - 1], awr, du, n_cosine)
+            if w.shape[0] == 0:
+                lost[j] += share
+                continue
+            row, off = deposit(lo, hi, w * share, coarse)
+            rows[j] += row
+            lost[j] += off
+    return rows, lost
+
+
+@needs_library
+@pytest.mark.parametrize(("name", "bottom"), [("U238", 4.0e6), ("O16", 1.0e5), ("Na23", 1.0e5)])
+def test_transfer_rows_match_depositing_each_reactions_segments(name, bottom):
+    # term_transfer deposits strata as it makes them and sums every reaction of a hat into one
+    # row, so it differs from the plain deposit only in the order of summation. Workers split hats
+    # and must not change a bit. Levels and laws in the centre of mass, correlated (U238) and
+    # Kalbach-Mann (O16), go by fans of strata; Na23's lab-frame evaporation by plain segments.
+    from zerog.energy.inelastic import coarse_grid, term_transfer
+    from zerog.energy.terms import _thresholds, awr
+
+    fine = np.geomspace(14.0e6, bottom, 201)
+    coarse = coarse_grid(fine, 0.02, _thresholds([(name, "294K")], 14.0e6, bottom))
+    rows, lost, _, _ = term_transfer(name, "294K", awr(name), coarse, 0.005, 8, workers=1)
+    expected, expected_lost = _transfer_oracle(name, awr(name), coarse, 0.005, 8)
+    dense = rows.dense()
+    scale = np.maximum(np.abs(expected).max(axis=1, keepdims=True), 1e-300)
+    assert np.all(np.abs(dense - expected) <= 1e-13 * scale)
+    np.testing.assert_allclose(lost, expected_lost, rtol=0.0, atol=1e-13)
+    parallel, parallel_lost, _, _ = term_transfer(
+        name, "294K", awr(name), coarse, 0.005, 8, workers=2
+    )
+    for field in ("starts", "first", "last", "values"):
+        np.testing.assert_array_equal(getattr(parallel, field), getattr(rows, field))
+    np.testing.assert_array_equal(parallel_lost, lost)
 
 
 @needs_library
@@ -284,3 +344,17 @@ def test_kernels_from_another_grid_are_refused():
     moved = replace(kernels, emission=np.zeros((1, n)))
     with pytest.raises(ValueError, match="grid"):
         build_operators(extra, np.ones((1, n)), np.zeros((1, n)), [0.0], inelastic=moved)
+
+
+@needs_library
+def test_a_warm_start_reproduces_the_cold_solve():
+    from zerog.energy.inelastic import restrict
+    from zerog.energy.subproblem import solve_energy
+
+    energy, ops, kernels = fe56_inelastic_case(0.05)
+    source = np.exp(-(((np.log(14.0e6 / energy) - 0.05) / 0.02) ** 2))
+    cold = solve_energy(ops, [0.08], [[0.08]], 0.0, source)
+    guess = restrict(kernels, energy, 1.01 * cold.flux, ops.rate_weights)
+    warm = solve_energy(ops, [0.08], [[0.08]], 0.0, source, initial=guess)
+    np.testing.assert_allclose(warm.flux, cold.flux, rtol=1e-11, atol=1e-11 * cold.flux.max())
+    assert warm.sweeps < cold.sweeps

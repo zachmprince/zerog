@@ -19,10 +19,12 @@ from zerog.energy.elastic import (
     AngleKernels,
     anisotropic_correction,
     compile_angle_tables,
+    moment_tree_add,
+    moment_tree_size,
     separable_correction,
     window_widths,
 )
-from zerog.energy.grid import MAX_PANEL, emission_weights, rate_weights, square_weights
+from zerog.energy.grid import MAX_PANEL, centred_weights, emission_weights, rate_weights
 from zerog.energy.inelastic import InelasticKernels, no_inelastic, panel_hats
 
 MAX_SWEEPS = 50
@@ -39,7 +41,7 @@ class EnergyOperators:
     alpha: np.ndarray
     rate_weights: np.ndarray
     emission_weights: np.ndarray
-    moment_weights: np.ndarray  # powers 0, 1 and 2 of E_i / E, as (3, panels, 4)
+    moment_weights: np.ndarray  # powers 0, 1 and 2 of E_i / E - 1, as (3, panels, 4)
     angle: AngleKernels
     inelastic: InelasticKernels
     panel_m: np.ndarray
@@ -110,7 +112,7 @@ def build_operators(energy, removal, scatter, alpha, angle=None, inelastic=None)
         alpha=alpha,
         rate_weights=rates,
         emission_weights=emissions,
-        moment_weights=np.stack([rates, emissions, square_weights(energy)]),
+        moment_weights=centred_weights(energy),
         angle=compile_angle_tables([None] * alpha.shape[0] if angle is None else angle),
         inelastic=kernels,
         panel_m=panel_m,
@@ -196,7 +198,7 @@ def _march(
     most the current block and the previous one, so the subtraction cancels only local magnitudes
     and F keeps its relative accuracy when it falls faster than E.
 
-    If separable, anisotropic terms keep three running moments in the same blocks, for
+    If separable, anisotropic terms keep a tree of centred panel moments, for
     separable_correction; otherwise they take the direct sum, anisotropic_correction.
     """
     n_terms = removal.shape[0]
@@ -213,16 +215,22 @@ def _march(
     slot = np.full(n_terms, -1)
     bottom = np.zeros(n_terms)
     n_slots = 0
+    # Panels the moment trees must hold: windows never reach below a term's bottom node.
+    tree_panels = 0
     for t in range(n_terms):
-        if separable and cutoff[t] < np.inf:
-            slot[t] = n_slots
-            n_slots += 1
+        reach = n - 1
         for m in range(n):
             if energy[m] <= cutoff[t]:
                 bottom[t] = energy[m]
+                reach = m
                 break
-    moments = np.zeros((n_slots, 3, n if n_slots > 0 else 0))
-    previous_moments = np.zeros((n_slots, 3))
+        if separable and cutoff[t] < np.inf:
+            slot[t] = n_slots
+            n_slots += 1
+            tree_panels = max(tree_panels, reach)
+    size = moment_tree_size(tree_panels + 1)
+    widths = np.log(energy[:-1] / energy[1:])
+    trees = np.zeros((n_slots, 2 * size if n_slots > 0 else 0, 4))
     for k in range(n):
         lhs = streaming
         rhs = source[k]
@@ -236,9 +244,6 @@ def _march(
                 previous_total[t] = running[t, k - 1]
                 running[t, k - 1] = 0.0
                 block_start[t] = k - 1
-                if slot[t] >= 0:
-                    previous_moments[slot[t]] = moments[slot[t], :, k - 1]
-                    moments[slot[t], :, k - 1] = 0.0
             i = 1.0 / energy[k - 1]
             known = running[t, k - 1] + i * flux[k - 1] * (sigma[k - 1] * w[0] + sigma[k] * w[2])
             own = i * (sigma[k - 1] * w[1] + sigma[k] * w[3])
@@ -266,10 +271,9 @@ def _march(
                     alpha[t],
                     pointer[t],
                     bottom[t],
-                    moments[slot[t]],
-                    previous_moments[slot[t]],
-                    block_start[t],
-                    moment_weights,
+                    widths,
+                    trees[slot[t]],
+                    size,
                     t,
                     tables,
                     table_energy,
@@ -334,20 +338,10 @@ def _march(
                 sigma = scatter[t]
                 w = weights[k - 1]
                 running[t, k] += flux[k] * (sigma[k - 1] * w[1] + sigma[k] * w[3]) / energy[k - 1]
-                s = slot[t]
-                if s >= 0:
-                    a = flux[k - 1]
-                    b = flux[k]
-                    for p in range(3):
-                        w = moment_weights[p, k - 1]
-                        moments[s, p, k] = (
-                            moments[s, p, k - 1]
-                            + (
-                                sigma[k - 1] * (w[0] * a + w[1] * b)
-                                + sigma[k] * (w[2] * a + w[3] * b)
-                            )
-                            / energy[k - 1] ** p
-                        )
+                if slot[t] >= 0 and k - 1 < tree_panels:
+                    moment_tree_add(
+                        trees[slot[t]], size, energy, sigma, flux, moment_weights, k - 1
+                    )
     return flux, diagonal, restricted
 
 
@@ -362,10 +356,12 @@ def _lagged_source(d_scatter, lagged, starts, first, last, values, n_coarse):
     return out
 
 
-def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable"):
+def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable", initial=None):
     """Solve for F. removal is (terms), scatter is (terms, orders), source is (energies).
 
     anisotropy is "separable" (elastic.separable_correction) or "direct", the oracle's direct sum.
+    initial is a first guess of the lagged inelastic emission, (terms, coarse nodes) as
+    zerog.energy.inelastic.restrict gives it, such as that of a previous flux; zero by default.
     """
     if anisotropy not in ("separable", "direct"):
         raise ValueError(f"anisotropy must be 'separable' or 'direct', not {anisotropy!r}")
@@ -382,6 +378,12 @@ def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable
         )
     kernels = ops.inelastic
     lagged = np.zeros((n_terms, kernels.coarse.shape[0]))
+    if initial is not None:
+        lagged = np.array(initial, dtype=float)
+        if lagged.shape != (n_terms, kernels.coarse.shape[0]):
+            raise ValueError(
+                f"shape: initial {lagged.shape} must be {(n_terms, kernels.coarse.shape[0])}"
+            )
     for sweep in range(1, MAX_SWEEPS + 1):
         coarse_source = _lagged_source(
             scatter[:, 0],

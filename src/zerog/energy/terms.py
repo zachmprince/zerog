@@ -44,9 +44,14 @@ def _awr(name):
 COARSE_DU = 0.00125
 
 
-def transport_grid(nuclides, rtol, atol, energy_max, energy_min, subdivide=1, coarse_du=COARSE_DU):
-    """A fine grid as elastic_grid, holding a coarse grid for inelastic transfer. Returns both."""
-    fine = elastic_grid(nuclides, rtol, atol, energy_max, energy_min, subdivide)
+def transport_grid(
+    nuclides, rtol, atol, energy_max, energy_min, subdivide=1, coarse_du=COARSE_DU, required=()
+):
+    """A fine grid as elastic_grid, holding a coarse grid for inelastic transfer. Returns both.
+
+    required energies, such as zerog.energy.fission.fission_nodes, become fine nodes.
+    """
+    fine = elastic_grid(nuclides, rtol, atol, energy_max, energy_min, subdivide, required)
     coarse = coarse_grid(fine, coarse_du, _thresholds(nuclides, energy_max, energy_min))
     return np.unique(np.concatenate([fine, coarse]))[::-1], coarse
 
@@ -60,7 +65,7 @@ def _thresholds(nuclides, energy_max, energy_min):
     return np.array(out)
 
 
-def elastic_grid(nuclides, rtol, atol, energy_max, energy_min, subdivide=1):
+def elastic_grid(nuclides, rtol, atol, energy_max, energy_min, subdivide=1, required=()):
     """A grid for elastic scattering between two energies, for (name, label) pairs.
 
     It holds node pairs at each term's first window edge below energy_max, where a point source
@@ -73,7 +78,8 @@ def elastic_grid(nuclides, rtol, atol, energy_max, energy_min, subdivide=1):
     angle = [_elastic_angle(name) for name, _ in nuclides]
     jumps = node_pairs([a * energy_max for a in alpha if a * energy_max > energy_min])
     max_du = 0.9 * min(-np.log(a) for a in alpha)
-    energy = assemble_grid(grids, energy_max, energy_min, max_du, required=jumps)
+    extra = np.concatenate([jumps, np.asarray(required, dtype=float)])
+    energy = assemble_grid(grids, energy_max, energy_min, max_du, required=extra)
     energy = refine_for_angle(energy, alpha, angle)
     if subdivide > 1:
         widths = np.log(energy[:-1] / energy[1:])

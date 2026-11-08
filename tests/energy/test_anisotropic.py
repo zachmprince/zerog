@@ -12,11 +12,19 @@ from zerog.energy.elastic import (
     angle_pdf,
     compile_angle_tables,
     lab_cosine,
+    moment_tree_add,
+    moment_tree_size,
     point_emission,
     refine_for_angle,
     table_moments,
 )
-from zerog.energy.grid import kinematic_alpha, node_pairs, panel_rate, rate_weights
+from zerog.energy.grid import (
+    centred_weights,
+    kinematic_alpha,
+    node_pairs,
+    panel_rate,
+    rate_weights,
+)
 from zerog.energy.subproblem import build_operators, solve_energy
 
 needs_library = pytest.mark.skipif(
@@ -247,7 +255,7 @@ def quad_row(energy, sigma, alpha, table, k):
     return row
 
 
-@pytest.mark.parametrize(("anisotropy", "rtol"), [("separable", 1e-8), ("direct", 2e-4)])
+@pytest.mark.parametrize(("anisotropy", "rtol"), [("separable", 1e-10), ("direct", 2e-4)])
 def test_march_matches_quadrature_oracle_with_negative_density(anisotropy, rtol):
     # The separable form is exact for the interpolants; the direct sum is quadrature.
     alpha = kinematic_alpha(11.9)
@@ -269,8 +277,8 @@ def test_march_matches_quadrature_oracle_with_negative_density(anisotropy, rtol)
 @pytest.mark.parametrize("awr", [11.9, 236.0])
 def test_separable_form_matches_quadrature_with_tables_varying_inside_a_window(awr):
     # Tables on different mu knots, a jump between two at one energy, and the top table held above
-    # the data, over three windows so the running moments restart in blocks. A flat table far
-    # below keeps the anisotropy cutoff off the grid, since quad_row has none.
+    # the data, over three windows. A flat table far below keeps the anisotropy cutoff off the
+    # grid, since quad_row has none.
     alpha = kinematic_alpha(awr)
     width = -np.log(alpha)
     top = TOP * np.exp(-0.3 * width)
@@ -304,9 +312,54 @@ def test_separable_form_matches_quadrature_with_tables_varying_inside_a_window(a
     a = np.diag(0.1 + ops.removal[0])
     for k in range(1, 61):
         a[k] -= 0.8 * quad_row(energy, sigma[0], alpha, table, k)
-    # Round-off in the running moments grows with the segment slopes times 2 / (1 - alpha): a peak
-    # of 40 rising over 0.02 of mu gives 2e-8 at awr 236, with quad tightened to 1e-13.
-    np.testing.assert_allclose(flux, np.linalg.solve(a, source), rtol=1e-7)
+    # A peak of 40 rising over 0.02 of mu cost the earlier running moments 2e-8 at awr 236 in
+    # round-off. Centred moments have no such cancellation: 1.5e-11 at awr 11.9, 1e-12 at 236.
+    np.testing.assert_allclose(flux, np.linalg.solve(a, source), rtol=1e-9)
+
+
+def test_moment_tree_nodes_hold_centred_moments_of_their_panels():
+    # Each complete node holds the integrals of sigma F (E_r / E - 1)^n du over its panels, with
+    # E_r its top energy, built from its children's by shifting their centres.
+    rng = np.random.default_rng(7)
+    energy = TOP * np.exp(-np.cumsum(np.concatenate([[0.0], rng.uniform(1e-4, 0.05, 36)])))
+    n = energy.shape[0]
+    sigma = rng.uniform(0.5, 2.0, n)
+    flux = rng.uniform(-1.0, 3.0, n)
+    size = moment_tree_size(n)
+    tree = np.zeros((2 * size, 4))
+    for p in range(n - 1):
+        moment_tree_add(tree, size, energy, sigma, flux, centred_weights(energy), p)
+    levels = int(np.log2(size))
+
+    def integrand(s, p, e_r, power):
+        e = energy[p] * np.exp(-s)
+        g = (energy[p] - e) / (energy[p] - energy[p + 1])
+        r = s / np.log(energy[p] / energy[p + 1])
+        value = ((1 - g) * sigma[p] + g * sigma[p + 1]) * ((1 - r) * flux[p] + r * flux[p + 1])
+        return value * (e_r / e - 1.0) ** power
+
+    checked = 0
+    for v in range(1, 2 * size):
+        height = levels - int(np.log2(v))
+        first = (v << height) - size
+        if first + (1 << height) > n - 1:
+            continue  # not complete: the grid ends inside it
+        e_r = energy[first]
+        for power in range(3):
+            expected = sum(
+                quad(
+                    integrand,
+                    0.0,
+                    np.log(energy[p] / energy[p + 1]),
+                    args=(p, e_r, power),
+                    epsabs=0.0,
+                    epsrel=1e-12,
+                )[0]
+                for p in range(first, first + (1 << height))
+            )
+            assert tree[v, power] == pytest.approx(expected, rel=1e-10, abs=1e-14 * abs(tree[v, 0]))
+        checked += 1
+    assert checked > 50
 
 
 @needs_library

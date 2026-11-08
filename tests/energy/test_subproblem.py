@@ -10,6 +10,7 @@ from zerog.energy.balance import energy_balance
 from zerog.energy.elastic import elastic_row
 from zerog.energy.grid import (
     build_grid,
+    centred_weights,
     emission_weights,
     interpolate,
     kinematic_alpha,
@@ -46,6 +47,7 @@ def test_panel_weights_match_quadrature():
     rates = rate_weights(energy)
     emissions = emission_weights(energy)
     squares = square_weights(energy)
+    centred = centred_weights(energy)
     for i in range(3):
         h = np.log(energy[i] / energy[i + 1])
 
@@ -85,6 +87,18 @@ def test_panel_weights_match_quadrature():
         assert sigma[i] * (q[0] * flux[i] + q[1] * flux[i + 1]) + sigma[i + 1] * (
             q[2] * flux[i] + q[3] * flux[i + 1]
         ) == pytest.approx(square, rel=1e-11, abs=1e-12)
+        for power, c in enumerate(centred[:, i]):
+            # (E_i / E - 1) ** p is tiny on a narrow panel, so tolerances scale with h ** p.
+            centred_moment = quad(
+                lambda s, p=power: s_of(s)[1] * s_of(s)[2] * np.expm1(s) ** p,
+                0.0,
+                h,
+                epsabs=1e-13 * h**power,
+                epsrel=1e-13,
+            )[0]
+            assert sigma[i] * (c[0] * flux[i] + c[1] * flux[i + 1]) + sigma[i + 1] * (
+                c[2] * flux[i] + c[3] * flux[i + 1]
+            ) == pytest.approx(centred_moment, rel=1e-11, abs=1e-12 * h**power)
 
 
 @pytest.mark.parametrize("awr", [0.9991673, 15.857, 236.0])

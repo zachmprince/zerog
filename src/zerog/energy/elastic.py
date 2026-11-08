@@ -13,8 +13,9 @@ elastic_row is the plain-Python oracle: a direct sum, independent of the running
 
 Anisotropy multiplies the integrand by 2 f(mu | E'), with mu = (2 E / E' - 1 - alpha) / (1 - alpha).
 The march keeps the recursion above for the isotropic part and adds 2 f - 1, which has zero mean,
-over the window. separable_correction does that in O(table knots) per node from three running
-moments; anisotropic_correction, a direct sum over the window's panels, is its quadrature oracle.
+over the window. separable_correction does that in O(table knots x log panels) per node from
+moments held in a tree over panels; anisotropic_correction, a direct sum over the window's panels,
+is its quadrature oracle.
 Both stop at the energy where a term's tables become flat. Like OpenMC
 v0.16.0 (AngleDistribution::sample, get_energy_index and Tabular::sample_unbiased), f is the mix of
 the two bounding tables, with weights linear in E', each lin-lin in mu. OpenMC samples mu at the lab
@@ -38,9 +39,6 @@ _GAUSS3_W = (5.0 / 18.0, 8.0 / 18.0, 5.0 / 18.0)
 PIECES_PER_PEAK = 8  # quadrature pieces per window, per unit of the local peak of f
 WIDE_WINDOW = 40.0  # stands in for an infinite window, when alpha is zero
 PEAK_RESOLUTION = 0.05  # largest panel, as a fraction of the window over the local peak of f
-# A segment of the separable form whose terms sum to more than this times its isotropic integral
-# would lose that factor in round-off, and is integrated by quadrature instead.
-CANCELLATION_LIMIT = 64.0
 
 
 @dataclass(frozen=True)
@@ -341,12 +339,19 @@ def elastic_row(energy, sigma, alpha, n):
 
 # The separable form of the anisotropic window. Between two table energies the mix weights are
 # linear in E', and on a segment of both tables' mu points each pdf is linear in mu, which is linear
-# in E / E'. So there (2 f - 1) / E' is a combination of 1, 1 / E' and 1 / E'^2, with coefficients
-# depending on E, and the window integral is a sum over segments of the running moments
-# M_n(E') = integral of sigma F / E'^n du from the block's start. The segments' edges are the
-# table energies and the knots of both tables mapped to E', so a node costs O(knots in its window)
-# instead of O(panels in it), and the integral is exact for the interpolants, as the oracle's
-# quadrature is only in the limit.
+# in E / E'. So there (2 f - 1) / E' is a quadratic in z = E_r / E', for any reference energy E_r.
+# The segments' edges are the table energies and the knots of both tables mapped to E', so a node
+# costs O(knots in its window), and the integral is exact for the interpolants.
+#
+# Expanded about z = 1, at a reference E_r inside the segment, the quadratic's terms are each
+# bounded by the kernel's own size over the range they act on, so nothing cancels however steep
+# the pdf or close the tables. Its coefficients multiply moments of sigma F (z - 1)^n, n = 0, 1, 2,
+# which must be centred at the same E_r and taken over panels no wider than the segment. A binary
+# tree over panels holds them: each node's moments are centred at its top energy, and a segment's
+# whole panels are O(log panels) nodes inside it. Partial panels at its ends, and the panel holding
+# the unknown, take Gauss quadrature of f itself. Earlier running moments in the basis 1, 1 / E',
+# 1 / E'^2 cancelled on steep segments and between close tables, and above about 100 keV most
+# segments fell back to quadrature over all their panels, O(window) per node.
 
 
 @njit(cache=True)
@@ -371,135 +376,135 @@ def _last_at_or_above(energy, i, e):
 
 
 @njit(cache=True)
-def _moments_at(energy, sigma, flux, moments, previous, block_start, k, i, e, weights):
-    """M_0, M_1, M_2 at e in panel i (i < k), as node i's stored value, the known part of the
-    piece from node i down to e, and that piece's coefficient of F[k], each for the three.
+def moment_tree_size(n_nodes):
+    """Leaves in a moment tree over a grid's panels: the next power of two."""
+    size = 1
+    while size < max(n_nodes - 1, 1):
+        size *= 2
+    return size
 
-    The stored value is returned apart so that differences between energies over the same node
-    cancel it exactly: it carries round-off from its whole block, which steep segments amplify.
-    moments holds the three per node, relative to each node's block; nodes before block_start
-    belong to the previous block, which ended at previous. weights are the panel weights for
-    powers 0, 1 and 2 of E_i / E', as (3, panels, 4).
+
+@njit(cache=True)
+def moment_tree_add(tree, size, energy, sigma, flux, weights, p):
+    """Store panel p's centred moments as a leaf of tree (2 size, 4), once F is known on it, and
+    complete each node that it ends. Panels must be added in order.
+
+    Node v at height h holds panels (v << h) - size onwards, 2^h of them, with moments of
+    sigma F (z - 1)^n du about its top energy in columns 0 to 2, and that energy's inverse in 3.
+    weights are centred_weights, as (3, panels, 4).
     """
-    k0 = k1 = k2 = 0.0
-    o0 = o1 = o2 = 0.0
-    upper = energy[i]
-    lower = energy[i + 1]
-    if i < block_start:
-        k0 = moments[0, i] - previous[0]
-        k1 = moments[1, i] - previous[1]
-        k2 = moments[2, i] - previous[2]
-    else:
-        k0 = moments[0, i]
-        k1 = moments[1, i]
-        k2 = moments[2, i]
-    if e >= upper:
-        return k0, k1, k2, 0.0, 0.0, 0.0, o0, o1, o2
-    a = 0.0  # coefficients of F[i] and F[i + 1] for each power
-    b = 0.0
-    a1 = b1 = a2 = b2 = 0.0
-    if e <= lower:
-        s0 = sigma[i]
-        s1 = sigma[i + 1]
-        w = weights[0, i]
-        a = s0 * w[0] + s1 * w[2]
-        b = s0 * w[1] + s1 * w[3]
-        w = weights[1, i]
-        a1 = (s0 * w[0] + s1 * w[2]) / upper
-        b1 = (s0 * w[1] + s1 * w[3]) / upper
-        w = weights[2, i]
-        a2 = (s0 * w[0] + s1 * w[2]) / (upper * upper)
-        b2 = (s0 * w[1] + s1 * w[3]) / (upper * upper)
-    else:
-        h = math.log(upper / lower)
-        span = math.log(upper / e)
-        pieces = 1 + int(span / 0.05)
-        step = span / pieces
-        for p in range(pieces):
-            for q in range(3):
-                s = (p + _GAUSS3_X[q]) * step
-                x = upper * math.exp(-s)
-                g = (upper - x) / (upper - lower)
-                r = s / h
-                v = _GAUSS3_W[q] * step * ((1.0 - g) * sigma[i] + g * sigma[i + 1])
-                inverse = 1.0 / x
-                a += v * (1.0 - r)
-                b += v * r
-                a1 += v * (1.0 - r) * inverse
-                b1 += v * r * inverse
-                a2 += v * (1.0 - r) * inverse * inverse
-                b2 += v * r * inverse * inverse
-    p0 = a * flux[i]
-    p1 = a1 * flux[i]
-    p2 = a2 * flux[i]
-    if i + 1 == k:
-        o0, o1, o2 = b, b1, b2
-    else:
-        p0 += b * flux[i + 1]
-        p1 += b1 * flux[i + 1]
-        p2 += b2 * flux[i + 1]
-    return k0, k1, k2, p0, p1, p2, o0, o1, o2
+    a = flux[p]
+    b = flux[p + 1]
+    s0 = sigma[p]
+    s1 = sigma[p + 1]
+    v = size + p
+    for q in range(3):
+        w = weights[q, p]
+        tree[v, q] = s0 * (w[0] * a + w[1] * b) + s1 * (w[2] * a + w[3] * b)
+    tree[v, 3] = 1.0 / energy[p]
+    h = 0
+    while v > 1 and (v & 1) == 1:
+        # v ends its parent, whose right half it is. Its moments move from its top to the parent's:
+        # z_parent - 1 = rho (z - 1) + delta, with rho the ratio of their top energies.
+        parent = v >> 1
+        h += 1
+        first = (parent << h) - size
+        upper = energy[first]
+        lower = energy[first + (1 << (h - 1))]
+        rho = upper / lower
+        delta = (upper - lower) / lower
+        r0 = tree[v, 0]
+        r1 = tree[v, 1]
+        r2 = tree[v, 2]
+        tree[parent, 0] = tree[v - 1, 0] + r0
+        tree[parent, 1] = tree[v - 1, 1] + rho * r1 + delta * r0
+        tree[parent, 2] = (
+            tree[v - 1, 2] + rho * rho * r2 + 2.0 * rho * delta * r1 + delta * delta * r0
+        )
+        tree[parent, 3] = tree[v - 1, 3]
+        v = parent
 
 
 @njit(cache=True)
-def _segment(mu, pdf, points, table, g):
-    """Table pdf on segment g as p0 + slope (x - m0), held constant past the ends."""
-    low = points[table]
-    high = points[table + 1] - 1
-    if g < low:
-        return pdf[low], 0.0, 0.0
-    if g >= high:
-        return pdf[high], 0.0, 0.0
-    slope = (pdf[g + 1] - pdf[g]) / (mu[g + 1] - mu[g])
-    return pdf[g], slope, mu[g]
+def _node_value(m0, m1, m2, inverse, e_r, ct, d, mix_a, mix_b):
+    """Integral of sigma F (2 f - 1) / E' over a tree node with centred moments m0, m1, m2 about
+    its top energy e_r, of inverse 1 / e_r, for one segment's f.
 
-
-@njit(cache=True)
-def _first_segment(mu, points, table, x):
-    """Last point of a table at or below x, or one before the table if none is."""
-    g = points[table] - 1
-    while g + 1 < points[table + 1] and mu[g + 1] <= x:
-        g += 1
-    return g
-
-
-@njit(cache=True)
-def _piece_quadrature(energy, sigma, flux, k, i, top, bottom, target, c, d, upper_mix, lower_mix):
-    """Integral of sigma F (2 f - 1) / E' du' from top down to bottom, starting in panel i, as
-    (known, coefficient of F[k]). f is the mix of two linear pdfs, each given as
-    (A, B, p0, slope, m0): weight A + B E' times p0 + slope (x - m0). It is smooth, so three Gauss
-    points per piece of a panel reach round-off.
+    Each table contributes its weight A + B E' times its pdf P + Q / E', with Q = slope c target.
+    About e_r, z (A + B E') = w_r + A (z - 1) and P + Q / E' = pi_r + (Q / e_r) (z - 1), where w_r
+    and pi_r are the weight and pdf at e_r, taken directly.
     """
-    a_a, b_a, p_a, m_a, mu_a = upper_mix
-    a_b, b_b, p_b, m_b, mu_b = lower_mix
+    a_a, b_a, p_a, m_a, mu_a = mix_a
+    a_b, b_b, p_b, m_b, mu_b = mix_b
+    x_r = ct * inverse + d
+    w_a = a_a + b_a * e_r
+    w_b = a_b + b_b * e_r
+    pi_a = p_a + m_a * (x_r - mu_a)
+    pi_b = p_b + m_b * (x_r - mu_b)
+    q_a = m_a * ct * inverse
+    q_b = m_b * ct * inverse
+    k0 = 2.0 * (w_a * pi_a + w_b * pi_b) - 1.0
+    k1 = 2.0 * (a_a * pi_a + w_a * q_a + a_b * pi_b + w_b * q_b) - 1.0
+    k2 = 2.0 * (a_a * q_a + a_b * q_b)
+    return (k0 * m0 + k1 * m1 + k2 * m2) * inverse
+
+
+@njit(cache=True)
+def _exp_minus(s):
+    """exp(-s), by its series for the small offsets inside panels, exact there to round-off."""
+    if 0.0 <= s < 0.01:
+        return 1.0 - s * (
+            1.0
+            - s
+            * (
+                0.5
+                - s
+                * (
+                    1.0 / 6.0
+                    - s * (1.0 / 24.0 - s * (1.0 / 120.0 - s * (1.0 / 720.0 - s / 5040.0)))
+                )
+            )
+        )
+    return math.exp(-s)
+
+
+@njit(cache=True)
+def _piece_quadrature(
+    upper, lower, h, sigma0, sigma1, flux0, flux1, unknown, first, end, ct, d, mix_a, mix_b
+):
+    """Integral of sigma F (2 f - 1) / E' du' over a panel of width h in lethargy, from first to
+    end below its top, as (known, coefficient of the lower node's F if unknown).
+
+    f is the mix of two linear pdfs, each given as (A, B, p0, slope, m0): weight A + B E' times
+    p0 + slope (x - m0). It is smooth, so three Gauss points per 0.05 of lethargy reach round-off.
+    Taking scalars, not arrays, spares the reference counting of a call per piece.
+    """
+    a_a, b_a, p_a, m_a, mu_a = mix_a
+    a_b, b_b, p_b, m_b, mu_b = mix_b
     known = 0.0
     own = 0.0
-    while i < k and energy[i] > bottom:
-        upper = energy[i]
-        lower = energy[i + 1]
-        h = math.log(upper / lower)
-        first = math.log(upper / top) if top < upper else 0.0
-        end = math.log(upper / bottom) if bottom > lower else h
-        pieces = 1 + int((end - first) / 0.05)
-        step = (end - first) / pieces
-        for p in range(pieces):
-            for q in range(3):
-                s = first + (p + _GAUSS3_X[q]) * step
-                e = upper * math.exp(-s)
-                x = c * target / e + d
-                f = (a_a + b_a * e) * (p_a + m_a * (x - mu_a)) + (a_b + b_b * e) * (
-                    p_b + m_b * (x - mu_b)
-                )
-                g = (upper - e) / (upper - lower)
-                kernel = _GAUSS3_W[q] * step * (2.0 * f - 1.0) / e
-                value = kernel * ((1.0 - g) * sigma[i] + g * sigma[i + 1])
-                r = s / h
-                known += value * (1.0 - r) * flux[i]
-                if i + 1 == k:
-                    own += value * r
-                else:
-                    known += value * r * flux[i + 1]
-        i += 1
+    span = 1.0 / (upper - lower)
+    width = 1.0 / h
+    pieces = 1 + int((end - first) / 0.05)
+    step = (end - first) / pieces
+    for p in range(pieces):
+        for q in range(3):
+            s = first + (p + _GAUSS3_X[q]) * step
+            e = upper * _exp_minus(s)
+            inverse = 1.0 / e
+            x = ct * inverse + d
+            f = (a_a + b_a * e) * (p_a + m_a * (x - mu_a)) + (a_b + b_b * e) * (
+                p_b + m_b * (x - mu_b)
+            )
+            g = (upper - e) * span
+            kernel = _GAUSS3_W[q] * step * (2.0 * f - 1.0) * inverse
+            value = kernel * ((1.0 - g) * sigma0 + g * sigma1)
+            r = s * width
+            known += value * (1.0 - r) * flux0
+            if unknown:
+                own += value * r
+            else:
+                known += value * r * flux1
     return known, own
 
 
@@ -512,10 +517,9 @@ def separable_correction(
     alpha,
     start,
     bottom,
-    moments,
-    previous,
-    block_start,
-    weights,
+    widths,
+    tree,
+    size,
     t,
     tables,
     table_energy,
@@ -526,12 +530,16 @@ def separable_correction(
     """anisotropic_correction's (known, own) by the separable form, exactly for the interpolants.
 
     The window runs from node k's edge, or the grid's top, down to energy[k] or bottom, whichever
-    is higher. start is a panel at or above the edge. moments must be complete for nodes before k.
-    On steep segments, near a forward peak, and between close table energies the moments' terms
-    cancel. Where they would amplify round-off past CANCELLATION_LIMIT, relative to the segment's
-    isotropic integral, the segment is integrated by quadrature over its panels instead.
+    is higher. start is a panel at or above the edge. widths are the panels' widths in lethargy.
+    tree holds the centred moments of every panel above k - 1, from moment_tree_add, with size
+    leaves.
+
+    Each segment's whole panels above node k - 1 come from the tree. Partial panels at either end,
+    and panel k - 1, whose lower node is the unknown, take quadrature. Searches and table lookups
+    are written out here, since a call passing arrays costs reference counting per segment.
     """
     target = energy[k]
+    n = energy.shape[0]
     high_e = min(target / alpha, energy[0]) if alpha > 0.0 else energy[0]
     low_e = max(target, bottom)
     known = 0.0
@@ -540,12 +548,10 @@ def separable_correction(
         return known, own
     c = 2.0 / (1.0 - alpha)
     d = -(1.0 + alpha) / (1.0 - alpha)
+    ct = c * target
+    # The segment's top lies in panel i, first_u below its top.
     i = min(_last_at_or_above(energy, start, high_e), k - 1)
-    v0, v1, v2, q0, q1, q2, w0, w1, w2 = _moments_at(
-        energy, sigma, flux, moments, previous, block_start, k, i, high_e, weights
-    )
-    # F[k] is unknown, so its neighbour stands in to size the cancellation.
-    guess = abs(flux[k - 1])
+    first_u = math.log(energy[i] / high_e) if high_e < energy[i] else 0.0
     # Table intervals from the top of the window down: j is the table above, j + 1 below.
     first = tables[t]
     last = tables[t + 1] - 1
@@ -570,71 +576,165 @@ def separable_correction(
             a_a, b_a = -table_energy[j + 1] / span, 1.0 / span
             a_b, b_b = table_energy[j] / span, -1.0 / span
         if lower_e < upper_e:
-            x = c * target / upper_e + d
-            x_end = c * target / lower_e + d
-            g_a = _first_segment(mu, points, s_a, x)
-            g_b = _first_segment(mu, points, s_b, x)
+            x = ct / upper_e + d
+            x_end = ct / lower_e + d
+            # Each table's last point at or below x, or one before the table if none is.
+            low_a = points[s_a] - 1
+            high_a = points[s_a + 1]
+            while high_a - low_a > 1:
+                middle = (low_a + high_a) // 2
+                if mu[middle] <= x:
+                    low_a = middle
+                else:
+                    high_a = middle
+            g_a = low_a
+            low_b = points[s_b] - 1
+            high_b = points[s_b + 1]
+            while high_b - low_b > 1:
+                middle = (low_b + high_b) // 2
+                if mu[middle] <= x:
+                    low_b = middle
+                else:
+                    high_b = middle
+            g_b = low_b
+            end_a = points[s_a + 1] - 1
+            end_b = points[s_b + 1] - 1
             piece_top = upper_e
             while True:
                 next_a = mu[g_a + 1] if g_a + 1 < points[s_a + 1] else np.inf
                 next_b = mu[g_b + 1] if g_b + 1 < points[s_b + 1] else np.inf
                 x_next = min(next_a, next_b, x_end)
                 if x_next > x:
-                    piece_bottom = lower_e if x_next >= x_end else c * target / (x_next - d)
+                    piece_bottom = lower_e if x_next >= x_end else ct / (x_next - d)
                     piece_bottom = min(max(piece_bottom, lower_e), piece_top)
-                    p_a, m_a, mu_a = _segment(mu, pdf, points, s_a, g_a)
-                    p_b, m_b, mu_b = _segment(mu, pdf, points, s_b, g_b)
-                    # Each pdf is P + Q / E' on the piece.
-                    big_p_a = p_a + m_a * (d - mu_a)
-                    big_q_a = m_a * c * target
-                    big_p_b = p_b + m_b * (d - mu_b)
-                    big_q_b = m_b * c * target
-                    k0 = 2.0 * (b_a * big_p_a + b_b * big_p_b)
-                    k1 = 2.0 * (a_a * big_p_a + b_a * big_q_a + a_b * big_p_b + b_b * big_q_b) - 1.0
-                    k2 = 2.0 * (a_a * big_q_a + a_b * big_q_b)
-                    i_top = i
-                    i = min(_last_at_or_above(energy, i, piece_bottom), k - 1)
-                    u0, u1, u2, r0, r1, r2, z0, z1, z2 = _moments_at(
-                        energy,
-                        sigma,
-                        flux,
-                        moments,
-                        previous,
-                        block_start,
-                        k,
-                        i,
-                        piece_bottom,
-                        weights,
-                    )
-                    t0 = k0 * ((u0 - v0) + (r0 - q0))
-                    t1 = k1 * ((u1 - v1) + (r1 - q1))
-                    t2 = k2 * ((u2 - v2) + (r2 - q2))
-                    o0 = k0 * (z0 - w0)
-                    o1 = k1 * (z1 - w1)
-                    o2 = k2 * (z2 - w2)
-                    size = abs(t0) + abs(t1) + abs(t2) + (abs(o0) + abs(o1) + abs(o2)) * guess
-                    isotropic = abs((u1 - v1) + (r1 - q1)) + abs(z1 - w1) * guess
-                    if size > CANCELLATION_LIMIT * isotropic:
-                        part, part_own = _piece_quadrature(
-                            energy,
-                            sigma,
-                            flux,
-                            k,
-                            i_top,
-                            piece_top,
-                            piece_bottom,
-                            target,
-                            c,
-                            d,
-                            (a_a, b_a, p_a, m_a, mu_a),
-                            (a_b, b_b, p_b, m_b, mu_b),
+                    if piece_bottom < piece_top:
+                        # Each table's pdf on the segment as p0 + slope (x - m0), held constant
+                        # past its ends.
+                        if g_a < points[s_a]:
+                            mix_a = (a_a, b_a, pdf[points[s_a]], 0.0, 0.0)
+                        elif g_a >= end_a:
+                            mix_a = (a_a, b_a, pdf[end_a], 0.0, 0.0)
+                        else:
+                            slope = (pdf[g_a + 1] - pdf[g_a]) / (mu[g_a + 1] - mu[g_a])
+                            mix_a = (a_a, b_a, pdf[g_a], slope, mu[g_a])
+                        if g_b < points[s_b]:
+                            mix_b = (a_b, b_b, pdf[points[s_b]], 0.0, 0.0)
+                        elif g_b >= end_b:
+                            mix_b = (a_b, b_b, pdf[end_b], 0.0, 0.0)
+                        else:
+                            slope = (pdf[g_b + 1] - pdf[g_b]) / (mu[g_b + 1] - mu[g_b])
+                            mix_b = (a_b, b_b, pdf[g_b], slope, mu[g_b])
+                        # The panel holding the segment's bottom: the last node at or above it.
+                        lower = i
+                        step = 1
+                        while lower + step < n and energy[lower + step] >= piece_bottom:
+                            lower += step
+                            step *= 2
+                        while step > 1:
+                            step //= 2
+                            if lower + step < n and energy[lower + step] >= piece_bottom:
+                                lower += step
+                        lower = min(lower, k - 1)
+                        last_u = (
+                            math.log(energy[lower] / piece_bottom)
+                            if piece_bottom < energy[lower]
+                            else 0.0
                         )
-                        known += part
-                        own += part_own
-                    else:
-                        known += t0 + t1 + t2
-                        own += o0 + o1 + o2
-                    v0, v1, v2, q0, q1, q2, w0, w1, w2 = u0, u1, u2, r0, r1, r2, z0, z1, z2
+                        if i == lower:
+                            part, part_own = _piece_quadrature(
+                                energy[i],
+                                energy[i + 1],
+                                widths[i],
+                                sigma[i],
+                                sigma[i + 1],
+                                flux[i],
+                                flux[i + 1],
+                                i + 1 == k,
+                                first_u,
+                                last_u,
+                                ct,
+                                d,
+                                mix_a,
+                                mix_b,
+                            )
+                            known += part
+                            own += part_own
+                        else:
+                            whole = i
+                            if first_u > 0.0:
+                                part, _ = _piece_quadrature(
+                                    energy[i],
+                                    energy[i + 1],
+                                    widths[i],
+                                    sigma[i],
+                                    sigma[i + 1],
+                                    flux[i],
+                                    flux[i + 1],
+                                    False,
+                                    first_u,
+                                    widths[i],
+                                    ct,
+                                    d,
+                                    mix_a,
+                                    mix_b,
+                                )
+                                known += part
+                                whole = i + 1
+                            if last_u > 0.0:
+                                part, part_own = _piece_quadrature(
+                                    energy[lower],
+                                    energy[lower + 1],
+                                    widths[lower],
+                                    sigma[lower],
+                                    sigma[lower + 1],
+                                    flux[lower],
+                                    flux[lower + 1],
+                                    lower + 1 == k,
+                                    0.0,
+                                    last_u,
+                                    ct,
+                                    d,
+                                    mix_a,
+                                    mix_b,
+                                )
+                                known += part
+                                own += part_own
+                            # Whole panels whole:lower, over the fewest tree nodes covering them.
+                            v_low = whole + size
+                            v_high = lower + size
+                            h = 0
+                            while v_low < v_high:
+                                if v_low & 1:
+                                    known += _node_value(
+                                        tree[v_low, 0],
+                                        tree[v_low, 1],
+                                        tree[v_low, 2],
+                                        tree[v_low, 3],
+                                        energy[(v_low << h) - size],
+                                        ct,
+                                        d,
+                                        mix_a,
+                                        mix_b,
+                                    )
+                                    v_low += 1
+                                if v_high & 1:
+                                    v_high -= 1
+                                    known += _node_value(
+                                        tree[v_high, 0],
+                                        tree[v_high, 1],
+                                        tree[v_high, 2],
+                                        tree[v_high, 3],
+                                        energy[(v_high << h) - size],
+                                        ct,
+                                        d,
+                                        mix_a,
+                                        mix_b,
+                                    )
+                                v_low >>= 1
+                                v_high >>= 1
+                                h += 1
+                        i = lower
+                        first_u = last_u
                     piece_top = piece_bottom
                     x = x_next
                 if x_next >= x_end:
