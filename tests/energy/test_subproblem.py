@@ -17,6 +17,7 @@ from zerog.energy.grid import (
     node_pairs,
     panel_rate,
     rate_weights,
+    square_weights,
 )
 from zerog.energy.subproblem import build_operators, solve_energy
 
@@ -44,6 +45,7 @@ def test_panel_weights_match_quadrature():
     flux = np.array([2.0, 5.0, -1.0, 4.0])
     rates = rate_weights(energy)
     emissions = emission_weights(energy)
+    squares = square_weights(energy)
     for i in range(3):
         h = np.log(energy[i] / energy[i + 1])
 
@@ -64,14 +66,25 @@ def test_panel_weights_match_quadrature():
             epsabs=1e-13,
             epsrel=1e-13,
         )[0]
+        square = quad(
+            lambda s: s_of(s)[1] * s_of(s)[2] * (energy[i] / s_of(s)[0]) ** 2,  # noqa: B023
+            0.0,
+            h,
+            epsabs=1e-13,
+            epsrel=1e-13,
+        )[0]
         r = rates[i]
         e = emissions[i]
+        q = squares[i]
         assert sigma[i] * (r[0] * flux[i] + r[1] * flux[i + 1]) + sigma[i + 1] * (
             r[2] * flux[i] + r[3] * flux[i + 1]
         ) == pytest.approx(rate, rel=1e-11, abs=1e-12)
         assert sigma[i] * (e[0] * flux[i] + e[1] * flux[i + 1]) + sigma[i + 1] * (
             e[2] * flux[i] + e[3] * flux[i + 1]
         ) == pytest.approx(emission, rel=1e-11, abs=1e-12)
+        assert sigma[i] * (q[0] * flux[i] + q[1] * flux[i + 1]) + sigma[i + 1] * (
+            q[2] * flux[i] + q[3] * flux[i + 1]
+        ) == pytest.approx(square, rel=1e-11, abs=1e-12)
 
 
 @pytest.mark.parametrize("awr", [0.9991673, 15.857, 236.0])
@@ -303,6 +316,12 @@ def test_solve_energy_refuses_mismatched_shapes(removal, scatter, source):
     ops = build_operators(energy, np.ones((1, 11)), np.ones((1, 11)), [0.5])
     with pytest.raises(ValueError, match="shape"):
         solve_energy(ops, removal, scatter, 0.0, source)
+
+
+def test_solve_energy_refuses_an_unknown_anisotropy_method():
+    energy, ops = two_term_case()
+    with pytest.raises(ValueError, match="anisotropy"):
+        solve_energy(ops, [1.0, 1.0], [[1.0], [1.0]], 0.0, np.ones_like(energy), "legendre")
 
 
 def test_panel_beyond_the_weights_range_is_refused():

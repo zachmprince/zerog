@@ -234,9 +234,10 @@ def quad_row(energy, sigma, alpha, table, k):
             hat = r if node else 1.0 - r
             return sigma_e * hat * density(e) / e**2
 
-        # Kinks fall at the table's knots, mapped to E' here.
-        knots = target * 2.0 / (1.0 + alpha + (1.0 - alpha) * table.mu[: table.offsets[1]])
-        inside = sorted(v for v in knots if lower < v < top)
+        # Kinks fall at every table's knots, mapped to E' here, and at the table energies.
+        knots = target * 2.0 / (1.0 + alpha + (1.0 - alpha) * np.unique(table.mu))
+        knots = np.concatenate([knots, table.energy])
+        inside = sorted({v for v in knots if lower < v < top})
         for node in (0, 1):
             row[i + node] += (
                 target
@@ -246,7 +247,9 @@ def quad_row(energy, sigma, alpha, table, k):
     return row
 
 
-def test_march_matches_quadrature_oracle_with_negative_density():
+@pytest.mark.parametrize(("anisotropy", "rtol"), [("separable", 1e-8), ("direct", 2e-4)])
+def test_march_matches_quadrature_oracle_with_negative_density(anisotropy, rtol):
+    # The separable form is exact for the interpolants; the direct sum is quadrature.
     alpha = kinematic_alpha(11.9)
     energy = TOP * np.exp(-np.linspace(0.0, 1.2, 61))
     sigma = (1.0 + 0.4 * np.sin(np.arange(61) * 0.7))[None, :]
@@ -256,11 +259,85 @@ def test_march_matches_quadrature_oracle_with_negative_density():
     d_scatter = -0.6
     streaming = 0.5
     source = np.exp(-np.arange(61) / 8.0)
-    flux = solve_energy(ops, [d_removal], [[d_scatter]], streaming, source).flux
+    flux = solve_energy(ops, [d_removal], [[d_scatter]], streaming, source, anisotropy).flux
     a = np.diag(streaming + d_removal * ops.removal[0])
     for k in range(1, 61):
         a[k] -= d_scatter * quad_row(energy, sigma[0], alpha, table, k)
-    np.testing.assert_allclose(flux, np.linalg.solve(a, source), rtol=2e-4)
+    np.testing.assert_allclose(flux, np.linalg.solve(a, source), rtol=rtol)
+
+
+@pytest.mark.parametrize("awr", [11.9, 236.0])
+def test_separable_form_matches_quadrature_with_tables_varying_inside_a_window(awr):
+    # Tables on different mu knots, a jump between two at one energy, and the top table held above
+    # the data, over three windows so the running moments restart in blocks. A flat table far
+    # below keeps the anisotropy cutoff off the grid, since quad_row has none.
+    alpha = kinematic_alpha(awr)
+    width = -np.log(alpha)
+    top = TOP * np.exp(-0.3 * width)
+    shapes = [
+        ([-1.0, 0.8, 0.98, 1.0], [0.05, 0.1, 2.0, 40.0]),
+        ([-1.0, 0.0, 1.0], [0.2, 0.4, 1.5]),
+        ([-1.0, -0.5, 0.5, 0.9, 1.0], [0.8, 0.3, 0.4, 1.0, 3.0]),
+        ([-1.0, 1.0], [0.7, 0.3]),
+        ([-1.0, 0.3, 1.0], [0.6, 0.4, 0.6]),
+        ([-1.0, 1.0], [0.5, 0.5]),
+    ]
+    energies = np.append(top * np.exp(-width * np.array([0.0, 0.7, 1.1, 1.1, 2.4])), 1.0e-5)
+    mus, pdfs = [], []
+    for mu, pdf in shapes:
+        mus.append(np.array(mu))
+        pdfs.append(np.array(pdf) / np.trapezoid(pdf, mu))
+    table = AngleTables(
+        energy=energies,
+        offsets=np.concatenate([[0], np.cumsum([m.shape[0] for m in mus])]),
+        interpolation=np.full(6, 2, dtype=np.int64),
+        mu=np.concatenate(mus),
+        pdf=np.concatenate(pdfs),
+        cdf=np.zeros(sum(m.shape[0] for m in mus)),
+    )
+    energy = TOP * np.exp(-np.linspace(0.0, 3.0 * width, 61))
+    sigma = (1.0 + 0.4 * np.sin(np.arange(61) * 0.7))[None, :]
+    ops = build_operators(energy, sigma + 0.2, sigma, [alpha], [table])
+    assert ops.angle.cutoff[0] < energy[-1]
+    source = np.exp(-np.arange(61) / 8.0)
+    flux = solve_energy(ops, [1.0], [[0.8]], 0.1, source).flux
+    a = np.diag(0.1 + ops.removal[0])
+    for k in range(1, 61):
+        a[k] -= 0.8 * quad_row(energy, sigma[0], alpha, table, k)
+    # Round-off in the running moments grows with the segment slopes times 2 / (1 - alpha): a peak
+    # of 40 rising over 0.02 of mu gives 2e-8 at awr 236, with quad tightened to 1e-13.
+    np.testing.assert_allclose(flux, np.linalg.solve(a, source), rtol=1e-7)
+
+
+@needs_library
+def test_separable_form_matches_the_direct_sum_with_real_data():
+    from zerog.energy.elastic import point_emission
+    from zerog.energy.terms import elastic_grid, load_term
+
+    nuclides = [("U238", "294K"), ("O16", "294K")]
+    top = 4.0e4
+    energy = elastic_grid(nuclides, 1e-3, 1e-8, top, 1.5e4)
+    terms = [load_term(name, label, energy) for name, label in nuclides]
+    ops = build_operators(
+        energy,
+        np.array([t.total for t in terms]),
+        np.array([t.elastic for t in terms]),
+        [t.alpha for t in terms],
+        [t.angle for t in terms],
+    )
+    d = np.array([0.02, 0.04])
+    source = sum(
+        density * point_emission(energy, top, t.alpha, t.angle)
+        for density, t in zip(d, terms, strict=True)
+    )
+    flux = {
+        method: solve_energy(ops, d, d[:, None], 0.0, source, method).flux
+        for method in ("separable", "direct")
+    }
+    # The direct sum's quadrature error, about 1e-6 on this grid, sets the tolerance.
+    np.testing.assert_allclose(flux["separable"], flux["direct"], rtol=2e-5)
+    capture = {m: panel_rate(terms[0].capture, f, ops.rate_weights) for m, f in flux.items()}
+    assert capture["separable"] == pytest.approx(capture["direct"], rel=1e-6)
 
 
 def test_cutoff_is_where_the_mix_between_sparse_tables_reaches_the_tolerance():

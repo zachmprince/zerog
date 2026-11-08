@@ -11,8 +11,9 @@ from cases import CASES, ENERGY_MIN, TEMPERATURE
 from zerog.energy.balance import energy_balance
 from zerog.energy.elastic import point_emission
 from zerog.energy.grid import panel_rate
+from zerog.energy.inelastic import build_inelastic, interpolate_hats, point_emission_coarse
 from zerog.energy.subproblem import build_operators, solve_energy
-from zerog.energy.terms import elastic_grid, load_term
+from zerog.energy.terms import awr, elastic_grid, load_term, transport_grid
 
 TWIN = Path(__file__).parents[3] / "benchmarks" / "02-elastic-fixed-source"
 
@@ -22,18 +23,35 @@ def run(name, rtol=1e-3, subdivide=1):
     e0 = case["source_energy"]
     densities = case["densities"]
     nuclides = [(n, TEMPERATURE) for n in densities]
-    grid = elastic_grid(nuclides, rtol, 1e-8, e0, ENERGY_MIN, subdivide)
+    fast = name.endswith("-fast")
+    if fast:
+        grid, coarse = transport_grid(nuclides, rtol, 1e-8, e0, ENERGY_MIN, subdivide)
+    else:
+        grid = elastic_grid(nuclides, rtol, 1e-8, e0, ENERGY_MIN, subdivide)
     summary = json.loads((TWIN / f"{name}.json").read_text())
     edges = np.array(summary["edges_low"])
     grid = np.unique(np.concatenate([grid, edges[edges > ENERGY_MIN]]))[::-1]
     terms = [load_term(n, TEMPERATURE, grid) for n in densities]
     d = np.array([densities[n] for n in densities])
+    start = time.perf_counter()
+    inelastic = (
+        build_inelastic(
+            [(n, TEMPERATURE, awr(n)) for n in densities],
+            grid,
+            coarse,
+            cache=Path(__file__).parent / "results" / "kernels",
+        )
+        if fast
+        else None
+    )
+    kernels = time.perf_counter() - start
     ops = build_operators(
         grid,
         np.array([t.total for t in terms]),
         np.array([t.elastic for t in terms]),
         [t.alpha for t in terms],
         [t.angle for t in terms],
+        inelastic,
     )
     # The source is the first collision: one neutron at e0 has not been slowed yet.
     total0 = float(d @ ops.removal[:, 0])
@@ -41,6 +59,11 @@ def run(name, rtol=1e-3, subdivide=1):
     for density, term in zip(d, terms, strict=True):
         weight = density * term.elastic[0] / total0
         source += weight * point_emission(grid, e0, term.alpha, term.angle)
+        if fast:
+            row, emission = point_emission_coarse(
+                term.name, TEMPERATURE, awr(term.name), e0, coarse
+            )
+            source += density * emission / total0 * interpolate_hats(ops, row)
     start = time.perf_counter()
     solution = solve_energy(ops, d, d[:, None], 0.0, source)
     elapsed = time.perf_counter() - start
@@ -48,7 +71,10 @@ def run(name, rtol=1e-3, subdivide=1):
     balance = energy_balance(ops, d, d[:, None], 0.0, source, flux)
 
     closure = balance.residual / balance.source
-    print(f"{name}: {grid.shape[0]} nodes, {elapsed:.2f} s, residual/source {closure:.2e}")
+    print(
+        f"{name}: {grid.shape[0]} nodes, {elapsed:.2f} s, {solution.sweeps} sweeps, "
+        f"kernels {kernels:.0f} s, residual/source {closure:.2e}"
+    )
     uncollided = 1.0 / total0
     for row in summary["rates"]:
         if row["score"] != "(n,gamma)":

@@ -9,6 +9,7 @@ from zerog.data.neutron import MT_CAPTURE, MT_ELASTIC, read_reactions
 from zerog.data.scatter import read_scattering_laws
 from zerog.energy.elastic import refine_for_angle
 from zerog.energy.grid import assemble_grid, interpolate, kinematic_alpha, node_pairs
+from zerog.energy.inelastic import coarse_grid
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,11 @@ class TermData:
     angle: object
 
 
+def awr(name):
+    """A nuclide's atomic weight ratio, from the library."""
+    return _awr(name)
+
+
 def _awr(name):
     import h5py
 
@@ -31,6 +37,27 @@ def _awr(name):
 
     with h5py.File(nuclide_path(name), "r") as f:
         return float(f[name].attrs["atomic_weight_ratio"])
+
+
+# Study 02 measured the coarse spacing on U238 + O16 from 14 MeV: the 7.68 MeV flux bin is off by
+# 2.3% at 0.005, 0.9% at 0.0025, 0.25% at 0.00125 and 0.22% at 0.000625, against 0.14% twin noise.
+COARSE_DU = 0.00125
+
+
+def transport_grid(nuclides, rtol, atol, energy_max, energy_min, subdivide=1, coarse_du=COARSE_DU):
+    """A fine grid as elastic_grid, holding a coarse grid for inelastic transfer. Returns both."""
+    fine = elastic_grid(nuclides, rtol, atol, energy_max, energy_min, subdivide)
+    coarse = coarse_grid(fine, coarse_du, _thresholds(nuclides, energy_max, energy_min))
+    return np.unique(np.concatenate([fine, coarse]))[::-1], coarse
+
+
+def _thresholds(nuclides, energy_max, energy_min):
+    out = []
+    for name, label in nuclides:
+        data = read_reactions(name, label)
+        keep = (data.threshold < energy_max) & (data.threshold > energy_min)
+        out.extend(data.threshold[keep].tolist())
+    return np.array(out)
 
 
 def elastic_grid(nuclides, rtol, atol, energy_max, energy_min, subdivide=1):

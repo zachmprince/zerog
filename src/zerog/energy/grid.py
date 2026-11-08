@@ -21,8 +21,8 @@ MAX_PANEL = 1.0
 
 
 @njit(cache=True)
-def _weights(h, inverse_energy, nodes, node_weights):
-    """Panel weights for width h, with a factor E_i / E in the integrand if inverse_energy."""
+def _weights(h, power, nodes, node_weights):
+    """Panel weights for width h, with a factor (E_i / E) ** power in the integrand."""
     w00 = w01 = w10 = w11 = 0.0
     denominator = math.expm1(-h)
     for q in range(nodes.shape[0]):
@@ -30,8 +30,8 @@ def _weights(h, inverse_energy, nodes, node_weights):
         s = t * h
         g = math.expm1(-s) / denominator
         v = node_weights[q] * h
-        if inverse_energy:
-            v *= math.exp(s)
+        if power != 0:
+            v *= math.exp(power * s)
         w00 += v * (1.0 - g) * (1.0 - t)
         w01 += v * (1.0 - g) * t
         w10 += v * g * (1.0 - t)
@@ -40,19 +40,19 @@ def _weights(h, inverse_energy, nodes, node_weights):
 
 
 @njit(cache=True)
-def _panel_weights(energy, inverse_energy, nodes, node_weights):
+def _panel_weights(energy, power, nodes, node_weights):
     n = energy.shape[0] - 1
     out = np.empty((n, 4))
     for i in range(n):
         out[i, 0], out[i, 1], out[i, 2], out[i, 3] = _weights(
-            math.log(energy[i] / energy[i + 1]), inverse_energy, nodes, node_weights
+            math.log(energy[i] / energy[i + 1]), power, nodes, node_weights
         )
     return out
 
 
 def rate_weights(energy):
     """Weights of the integral of sigma(E) F(u) du per panel, as (panels, 4)."""
-    return _panel_weights(energy, False, _GAUSS_S, _GAUSS_W)
+    return _panel_weights(energy, 0, _GAUSS_S, _GAUSS_W)
 
 
 def emission_weights(energy):
@@ -60,7 +60,15 @@ def emission_weights(energy):
 
     Divide by the panel's upper energy E_i to get the integral with 1 / E in the integrand.
     """
-    return _panel_weights(energy, True, _GAUSS_S, _GAUSS_W)
+    return _panel_weights(energy, 1, _GAUSS_S, _GAUSS_W)
+
+
+def square_weights(energy):
+    """Weights of the integral of sigma(E) F(u) (E_i / E) ** 2 du per panel, as (panels, 4).
+
+    Divide by the square of the panel's upper energy to get the integral with 1 / E ** 2.
+    """
+    return _panel_weights(energy, 2, _GAUSS_S, _GAUSS_W)
 
 
 def panel_rate(sigma, flux, weights):

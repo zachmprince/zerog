@@ -12,8 +12,10 @@ than each window, so that the edge never falls in the panel holding the unknown.
 elastic_row is the plain-Python oracle: a direct sum, independent of the running integral.
 
 Anisotropy multiplies the integrand by 2 f(mu | E'), with mu = (2 E / E' - 1 - alpha) / (1 - alpha).
-The march keeps the recursion above for the isotropic part and adds 2 f - 1, which has zero mean, by
-direct sum over the window. It stops at the energy where a term's tables become flat. Like OpenMC
+The march keeps the recursion above for the isotropic part and adds 2 f - 1, which has zero mean,
+over the window. separable_correction does that in O(table knots) per node from three running
+moments; anisotropic_correction, a direct sum over the window's panels, is its quadrature oracle.
+Both stop at the energy where a term's tables become flat. Like OpenMC
 v0.16.0 (AngleDistribution::sample, get_energy_index and Tabular::sample_unbiased), f is the mix of
 the two bounding tables, with weights linear in E', each lin-lin in mu. OpenMC samples mu at the lab
 energy, and at or above the free gas threshold the target is at rest, as it is here.
@@ -36,6 +38,9 @@ _GAUSS3_W = (5.0 / 18.0, 8.0 / 18.0, 5.0 / 18.0)
 PIECES_PER_PEAK = 8  # quadrature pieces per window, per unit of the local peak of f
 WIDE_WINDOW = 40.0  # stands in for an infinite window, when alpha is zero
 PEAK_RESOLUTION = 0.05  # largest panel, as a fraction of the window over the local peak of f
+# A segment of the separable form whose terms sum to more than this times its isotropic integral
+# would lose that factor in round-off, and is integrated by quadrature instead.
+CANCELLATION_LIMIT = 64.0
 
 
 @dataclass(frozen=True)
@@ -332,3 +337,312 @@ def elastic_row(energy, sigma, alpha, n):
                 + sigma[i + 1] * w[3]
             )
     return row
+
+
+# The separable form of the anisotropic window. Between two table energies the mix weights are
+# linear in E', and on a segment of both tables' mu points each pdf is linear in mu, which is linear
+# in E / E'. So there (2 f - 1) / E' is a combination of 1, 1 / E' and 1 / E'^2, with coefficients
+# depending on E, and the window integral is a sum over segments of the running moments
+# M_n(E') = integral of sigma F / E'^n du from the block's start. The segments' edges are the
+# table energies and the knots of both tables mapped to E', so a node costs O(knots in its window)
+# instead of O(panels in it), and the integral is exact for the interpolants, as the oracle's
+# quadrature is only in the limit.
+
+
+@njit(cache=True)
+def _last_at_or_above(energy, i, e):
+    """The last node at or above e, searching on from node i, which must be at or above it."""
+    n = energy.shape[0]
+    low = i
+    high = i + 1
+    step = 1
+    while high < n and energy[high] >= e:
+        low = high
+        high = low + step
+        step *= 2
+    high = min(high, n)
+    while high - low > 1:
+        middle = (low + high) // 2
+        if energy[middle] >= e:
+            low = middle
+        else:
+            high = middle
+    return low
+
+
+@njit(cache=True)
+def _moments_at(energy, sigma, flux, moments, previous, block_start, k, i, e, weights):
+    """M_0, M_1, M_2 at e in panel i (i < k), as node i's stored value, the known part of the
+    piece from node i down to e, and that piece's coefficient of F[k], each for the three.
+
+    The stored value is returned apart so that differences between energies over the same node
+    cancel it exactly: it carries round-off from its whole block, which steep segments amplify.
+    moments holds the three per node, relative to each node's block; nodes before block_start
+    belong to the previous block, which ended at previous. weights are the panel weights for
+    powers 0, 1 and 2 of E_i / E', as (3, panels, 4).
+    """
+    k0 = k1 = k2 = 0.0
+    o0 = o1 = o2 = 0.0
+    upper = energy[i]
+    lower = energy[i + 1]
+    if i < block_start:
+        k0 = moments[0, i] - previous[0]
+        k1 = moments[1, i] - previous[1]
+        k2 = moments[2, i] - previous[2]
+    else:
+        k0 = moments[0, i]
+        k1 = moments[1, i]
+        k2 = moments[2, i]
+    if e >= upper:
+        return k0, k1, k2, 0.0, 0.0, 0.0, o0, o1, o2
+    a = 0.0  # coefficients of F[i] and F[i + 1] for each power
+    b = 0.0
+    a1 = b1 = a2 = b2 = 0.0
+    if e <= lower:
+        s0 = sigma[i]
+        s1 = sigma[i + 1]
+        w = weights[0, i]
+        a = s0 * w[0] + s1 * w[2]
+        b = s0 * w[1] + s1 * w[3]
+        w = weights[1, i]
+        a1 = (s0 * w[0] + s1 * w[2]) / upper
+        b1 = (s0 * w[1] + s1 * w[3]) / upper
+        w = weights[2, i]
+        a2 = (s0 * w[0] + s1 * w[2]) / (upper * upper)
+        b2 = (s0 * w[1] + s1 * w[3]) / (upper * upper)
+    else:
+        h = math.log(upper / lower)
+        span = math.log(upper / e)
+        pieces = 1 + int(span / 0.05)
+        step = span / pieces
+        for p in range(pieces):
+            for q in range(3):
+                s = (p + _GAUSS3_X[q]) * step
+                x = upper * math.exp(-s)
+                g = (upper - x) / (upper - lower)
+                r = s / h
+                v = _GAUSS3_W[q] * step * ((1.0 - g) * sigma[i] + g * sigma[i + 1])
+                inverse = 1.0 / x
+                a += v * (1.0 - r)
+                b += v * r
+                a1 += v * (1.0 - r) * inverse
+                b1 += v * r * inverse
+                a2 += v * (1.0 - r) * inverse * inverse
+                b2 += v * r * inverse * inverse
+    p0 = a * flux[i]
+    p1 = a1 * flux[i]
+    p2 = a2 * flux[i]
+    if i + 1 == k:
+        o0, o1, o2 = b, b1, b2
+    else:
+        p0 += b * flux[i + 1]
+        p1 += b1 * flux[i + 1]
+        p2 += b2 * flux[i + 1]
+    return k0, k1, k2, p0, p1, p2, o0, o1, o2
+
+
+@njit(cache=True)
+def _segment(mu, pdf, points, table, g):
+    """Table pdf on segment g as p0 + slope (x - m0), held constant past the ends."""
+    low = points[table]
+    high = points[table + 1] - 1
+    if g < low:
+        return pdf[low], 0.0, 0.0
+    if g >= high:
+        return pdf[high], 0.0, 0.0
+    slope = (pdf[g + 1] - pdf[g]) / (mu[g + 1] - mu[g])
+    return pdf[g], slope, mu[g]
+
+
+@njit(cache=True)
+def _first_segment(mu, points, table, x):
+    """Last point of a table at or below x, or one before the table if none is."""
+    g = points[table] - 1
+    while g + 1 < points[table + 1] and mu[g + 1] <= x:
+        g += 1
+    return g
+
+
+@njit(cache=True)
+def _piece_quadrature(energy, sigma, flux, k, i, top, bottom, target, c, d, upper_mix, lower_mix):
+    """Integral of sigma F (2 f - 1) / E' du' from top down to bottom, starting in panel i, as
+    (known, coefficient of F[k]). f is the mix of two linear pdfs, each given as
+    (A, B, p0, slope, m0): weight A + B E' times p0 + slope (x - m0). It is smooth, so three Gauss
+    points per piece of a panel reach round-off.
+    """
+    a_a, b_a, p_a, m_a, mu_a = upper_mix
+    a_b, b_b, p_b, m_b, mu_b = lower_mix
+    known = 0.0
+    own = 0.0
+    while i < k and energy[i] > bottom:
+        upper = energy[i]
+        lower = energy[i + 1]
+        h = math.log(upper / lower)
+        first = math.log(upper / top) if top < upper else 0.0
+        end = math.log(upper / bottom) if bottom > lower else h
+        pieces = 1 + int((end - first) / 0.05)
+        step = (end - first) / pieces
+        for p in range(pieces):
+            for q in range(3):
+                s = first + (p + _GAUSS3_X[q]) * step
+                e = upper * math.exp(-s)
+                x = c * target / e + d
+                f = (a_a + b_a * e) * (p_a + m_a * (x - mu_a)) + (a_b + b_b * e) * (
+                    p_b + m_b * (x - mu_b)
+                )
+                g = (upper - e) / (upper - lower)
+                kernel = _GAUSS3_W[q] * step * (2.0 * f - 1.0) / e
+                value = kernel * ((1.0 - g) * sigma[i] + g * sigma[i + 1])
+                r = s / h
+                known += value * (1.0 - r) * flux[i]
+                if i + 1 == k:
+                    own += value * r
+                else:
+                    known += value * r * flux[i + 1]
+        i += 1
+    return known, own
+
+
+@njit(cache=True)
+def separable_correction(
+    energy,
+    k,
+    sigma,
+    flux,
+    alpha,
+    start,
+    bottom,
+    moments,
+    previous,
+    block_start,
+    weights,
+    t,
+    tables,
+    table_energy,
+    points,
+    mu,
+    pdf,
+):
+    """anisotropic_correction's (known, own) by the separable form, exactly for the interpolants.
+
+    The window runs from node k's edge, or the grid's top, down to energy[k] or bottom, whichever
+    is higher. start is a panel at or above the edge. moments must be complete for nodes before k.
+    On steep segments, near a forward peak, and between close table energies the moments' terms
+    cancel. Where they would amplify round-off past CANCELLATION_LIMIT, relative to the segment's
+    isotropic integral, the segment is integrated by quadrature over its panels instead.
+    """
+    target = energy[k]
+    high_e = min(target / alpha, energy[0]) if alpha > 0.0 else energy[0]
+    low_e = max(target, bottom)
+    known = 0.0
+    own = 0.0
+    if high_e <= low_e:
+        return known, own
+    c = 2.0 / (1.0 - alpha)
+    d = -(1.0 + alpha) / (1.0 - alpha)
+    i = min(_last_at_or_above(energy, start, high_e), k - 1)
+    v0, v1, v2, q0, q1, q2, w0, w1, w2 = _moments_at(
+        energy, sigma, flux, moments, previous, block_start, k, i, high_e, weights
+    )
+    # F[k] is unknown, so its neighbour stands in to size the cancellation.
+    guess = abs(flux[k - 1])
+    # Table intervals from the top of the window down: j is the table above, j + 1 below.
+    first = tables[t]
+    last = tables[t + 1] - 1
+    j = first - 1
+    while j + 1 <= last and table_energy[j + 1] >= high_e:
+        j += 1
+    upper_e = high_e
+    while upper_e > low_e:
+        if j < first:
+            lower_e = max(low_e, table_energy[first])
+            s_a, s_b = first, first
+            a_a, b_a, a_b, b_b = 1.0, 0.0, 0.0, 0.0
+        elif j >= last:
+            lower_e = low_e
+            s_a, s_b = last, last
+            a_a, b_a, a_b, b_b = 1.0, 0.0, 0.0, 0.0
+        else:
+            lower_e = max(low_e, table_energy[j + 1])
+            s_a, s_b = j, j + 1
+            span = table_energy[j] - table_energy[j + 1]
+            # Weights A + B E' of the upper and lower tables, linear in E'.
+            a_a, b_a = -table_energy[j + 1] / span, 1.0 / span
+            a_b, b_b = table_energy[j] / span, -1.0 / span
+        if lower_e < upper_e:
+            x = c * target / upper_e + d
+            x_end = c * target / lower_e + d
+            g_a = _first_segment(mu, points, s_a, x)
+            g_b = _first_segment(mu, points, s_b, x)
+            piece_top = upper_e
+            while True:
+                next_a = mu[g_a + 1] if g_a + 1 < points[s_a + 1] else np.inf
+                next_b = mu[g_b + 1] if g_b + 1 < points[s_b + 1] else np.inf
+                x_next = min(next_a, next_b, x_end)
+                if x_next > x:
+                    piece_bottom = lower_e if x_next >= x_end else c * target / (x_next - d)
+                    piece_bottom = min(max(piece_bottom, lower_e), piece_top)
+                    p_a, m_a, mu_a = _segment(mu, pdf, points, s_a, g_a)
+                    p_b, m_b, mu_b = _segment(mu, pdf, points, s_b, g_b)
+                    # Each pdf is P + Q / E' on the piece.
+                    big_p_a = p_a + m_a * (d - mu_a)
+                    big_q_a = m_a * c * target
+                    big_p_b = p_b + m_b * (d - mu_b)
+                    big_q_b = m_b * c * target
+                    k0 = 2.0 * (b_a * big_p_a + b_b * big_p_b)
+                    k1 = 2.0 * (a_a * big_p_a + b_a * big_q_a + a_b * big_p_b + b_b * big_q_b) - 1.0
+                    k2 = 2.0 * (a_a * big_q_a + a_b * big_q_b)
+                    i_top = i
+                    i = min(_last_at_or_above(energy, i, piece_bottom), k - 1)
+                    u0, u1, u2, r0, r1, r2, z0, z1, z2 = _moments_at(
+                        energy,
+                        sigma,
+                        flux,
+                        moments,
+                        previous,
+                        block_start,
+                        k,
+                        i,
+                        piece_bottom,
+                        weights,
+                    )
+                    t0 = k0 * ((u0 - v0) + (r0 - q0))
+                    t1 = k1 * ((u1 - v1) + (r1 - q1))
+                    t2 = k2 * ((u2 - v2) + (r2 - q2))
+                    o0 = k0 * (z0 - w0)
+                    o1 = k1 * (z1 - w1)
+                    o2 = k2 * (z2 - w2)
+                    size = abs(t0) + abs(t1) + abs(t2) + (abs(o0) + abs(o1) + abs(o2)) * guess
+                    isotropic = abs((u1 - v1) + (r1 - q1)) + abs(z1 - w1) * guess
+                    if size > CANCELLATION_LIMIT * isotropic:
+                        part, part_own = _piece_quadrature(
+                            energy,
+                            sigma,
+                            flux,
+                            k,
+                            i_top,
+                            piece_top,
+                            piece_bottom,
+                            target,
+                            c,
+                            d,
+                            (a_a, b_a, p_a, m_a, mu_a),
+                            (a_b, b_b, p_b, m_b, mu_b),
+                        )
+                        known += part
+                        own += part_own
+                    else:
+                        known += t0 + t1 + t2
+                        own += o0 + o1 + o2
+                    v0, v1, v2, q0, q1, q2, w0, w1, w2 = u0, u1, u2, r0, r1, r2, z0, z1, z2
+                    piece_top = piece_bottom
+                    x = x_next
+                if x_next >= x_end:
+                    break
+                if next_a <= x_next:
+                    g_a += 1
+                if next_b <= x_next:
+                    g_b += 1
+        upper_e = lower_e
+        j += 1
+    return known, own

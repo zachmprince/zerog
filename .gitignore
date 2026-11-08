@@ -17,3 +17,6 @@ dist/
 studies/*/results/
 .env
 benchmarks/*/results/
+studies/*/scripts/results/
+benchmarks/twins.*
+.claude/worktrees/

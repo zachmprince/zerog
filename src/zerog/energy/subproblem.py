@@ -19,9 +19,14 @@ from zerog.energy.elastic import (
     AngleKernels,
     anisotropic_correction,
     compile_angle_tables,
+    separable_correction,
     window_widths,
 )
-from zerog.energy.grid import MAX_PANEL, emission_weights, rate_weights
+from zerog.energy.grid import MAX_PANEL, emission_weights, rate_weights, square_weights
+from zerog.energy.inelastic import InelasticKernels, no_inelastic, panel_hats
+
+MAX_SWEEPS = 50
+SWEEP_TOLERANCE = 1e-12  # on the hats' emission, relative to the largest
 
 
 @dataclass(frozen=True)
@@ -34,12 +39,18 @@ class EnergyOperators:
     alpha: np.ndarray
     rate_weights: np.ndarray
     emission_weights: np.ndarray
+    moment_weights: np.ndarray  # powers 0, 1 and 2 of E_i / E, as (3, panels, 4)
     angle: AngleKernels
+    inelastic: InelasticKernels
+    panel_m: np.ndarray
+    panel_share: np.ndarray
+    node_m: np.ndarray
+    node_theta: np.ndarray
 
 
 @dataclass(frozen=True)
 class EnergySolution:
-    """F at the nodes, and each node's solved diagonal in 1/cm.
+    """F at the nodes, each node's solved diagonal in 1/cm, and the inelastic sweeps it took.
 
     A diagonal at or near zero means a singular subproblem at that node. It can happen with negative
     densities, and it is reported here, not treated.
@@ -47,12 +58,15 @@ class EnergySolution:
 
     flux: np.ndarray
     diagonal: np.ndarray
+    sweeps: int = 1
 
 
-def build_operators(energy, removal, scatter, alpha, angle=None):
+def build_operators(energy, removal, scatter, alpha, angle=None, inelastic=None):
     """Check a grid against its terms, and collect the panel weights.
 
     angle is a list of AngleTables per term, with None for an isotropic one. None means all are.
+    inelastic is InelasticKernels from zerog.energy.inelastic.build_inelastic, or None for none.
+    Its emission adds to scattering, so removal must hold the term's whole total cross section.
     """
     energy = np.asarray(energy, dtype=float)
     if np.any(np.diff(energy) >= 0.0):
@@ -71,14 +85,38 @@ def build_operators(energy, removal, scatter, alpha, angle=None):
     narrowest = window_widths(alpha).min()
     if widest >= narrowest:
         raise ValueError(f"panel of {widest} wider than the narrowest elastic window, {narrowest}")
+    kernels = no_inelastic(energy, alpha.shape[0]) if inelastic is None else inelastic
+    if kernels.emission.shape != expected:
+        raise ValueError(f"shape: inelastic emission {kernels.emission.shape} must be {expected}")
+    # Kernels built on another grid would restrict and prolong across the wrong panels, silently.
+    index = kernels.coarse_index
+    if (
+        index.shape != kernels.coarse.shape
+        or index.max() >= energy.shape[0]
+        or not np.array_equal(energy[index], kernels.coarse)
+        or index[0] != 0
+        or index[-1] != energy.shape[0] - 1
+    ):
+        raise ValueError(
+            "inelastic kernels were built on a grid that this energy grid doesn't hold"
+        )
+    panel_m, panel_share, node_m, node_theta = panel_hats(energy, kernels.coarse)
+    rates = rate_weights(energy)
+    emissions = emission_weights(energy)
     return EnergyOperators(
         energy=energy,
         removal=removal,
         scatter=scatter,
         alpha=alpha,
-        rate_weights=rate_weights(energy),
-        emission_weights=emission_weights(energy),
+        rate_weights=rates,
+        emission_weights=emissions,
+        moment_weights=np.stack([rates, emissions, square_weights(energy)]),
         angle=compile_angle_tables([None] * alpha.shape[0] if angle is None else angle),
+        inelastic=kernels,
+        panel_m=panel_m,
+        panel_share=panel_share,
+        node_m=node_m,
+        node_theta=node_theta,
     )
 
 
@@ -131,12 +169,35 @@ def _march(
     pdf,
     cutoff,
     peak,
+    rates,
+    emission,
+    hat,
+    coarse_index,
+    panel_m,
+    panel_share,
+    node_m,
+    node_theta,
+    starts,
+    first,
+    last,
+    values,
+    lagged,
+    coarse_source,
+    separable,
+    moment_weights,
 ):
     """Forward substitution over the nodes.
+
+    Inelastic emission is restricted to coarse hats as each panel completes. A hat's row goes to
+    coarse_source once the march leaves the hat, replacing its lagged value; what lands in hats not
+    yet passed stays lagged until the caller's next sweep.
 
     Each term's running integral restarts once its block is a window wide. A window then spans at
     most the current block and the previous one, so the subtraction cancels only local magnitudes
     and F keeps its relative accuracy when it falls faster than E.
+
+    If separable, anisotropic terms keep three running moments in the same blocks, for
+    separable_correction; otherwise they take the direct sum, anisotropic_correction.
     """
     n_terms = removal.shape[0]
     n = energy.shape[0]
@@ -147,6 +208,21 @@ def _march(
     block_start = np.zeros(n_terms, dtype=np.int64)
     previous_total = np.zeros(n_terms)
     width = np.array([-np.log(a) if a > 0.0 else WIDE_WINDOW for a in alpha])
+    restricted = np.zeros(lagged.shape)
+    # Anisotropic terms' slots in moments, and the node below which their direct sums stop.
+    slot = np.full(n_terms, -1)
+    bottom = np.zeros(n_terms)
+    n_slots = 0
+    for t in range(n_terms):
+        if separable and cutoff[t] < np.inf:
+            slot[t] = n_slots
+            n_slots += 1
+        for m in range(n):
+            if energy[m] <= cutoff[t]:
+                bottom[t] = energy[m]
+                break
+    moments = np.zeros((n_slots, 3, n if n_slots > 0 else 0))
+    previous_moments = np.zeros((n_slots, 3))
     for k in range(n):
         lhs = streaming
         rhs = source[k]
@@ -160,6 +236,9 @@ def _march(
                 previous_total[t] = running[t, k - 1]
                 running[t, k - 1] = 0.0
                 block_start[t] = k - 1
+                if slot[t] >= 0:
+                    previous_moments[slot[t]] = moments[slot[t], :, k - 1]
+                    moments[slot[t], :, k - 1] = 0.0
             i = 1.0 / energy[k - 1]
             known = running[t, k - 1] + i * flux[k - 1] * (sigma[k - 1] * w[0] + sigma[k] * w[2])
             own = i * (sigma[k - 1] * w[1] + sigma[k] * w[3])
@@ -178,7 +257,29 @@ def _march(
                     window += -part if j >= block_start[t] else previous_total[t] - part
                 else:
                     window += previous_total[t]
-            if energy[pointer[t]] > cutoff[t]:
+            if slot[t] >= 0 and energy[pointer[t]] > cutoff[t]:
+                extra, extra_own = separable_correction(
+                    energy,
+                    k,
+                    sigma,
+                    flux,
+                    alpha[t],
+                    pointer[t],
+                    bottom[t],
+                    moments[slot[t]],
+                    previous_moments[slot[t]],
+                    block_start[t],
+                    moment_weights,
+                    t,
+                    tables,
+                    table_energy,
+                    points,
+                    mu,
+                    pdf,
+                )
+                window += extra
+                own += extra_own
+            elif energy[pointer[t]] > cutoff[t]:
                 extra, extra_own, mean = anisotropic_correction(
                     energy,
                     k,
@@ -206,18 +307,68 @@ def _march(
             lhs -= d_scatter[t] * factor * own
             rhs += d_scatter[t] * factor * window
             running[t, k] = known  # completed below, once F[k] is known
+        m = node_m[k]
+        theta = node_theta[k]
+        rhs += (1.0 - theta) * coarse_source[m] / hat[m] + theta * coarse_source[m + 1] / hat[m + 1]
         diagonal[k] = lhs
         flux[k] = rhs / lhs
+        if k > 0 and values.shape[0] > 0:
+            p = panel_m[k - 1]
+            w = rates[k - 1]
+            for t in range(n_terms):
+                sigma = emission[t]
+                rate = sigma[k - 1] * (w[0] * flux[k - 1] + w[1] * flux[k]) + sigma[k] * (
+                    w[2] * flux[k - 1] + w[3] * flux[k]
+                )
+                restricted[t, p] += rate * panel_share[k - 1]
+                restricted[t, p + 1] += rate * (1.0 - panel_share[k - 1])
+            if k == coarse_index[p + 1]:
+                # Hat p is complete: send its emission, less what the lagged pass already sent.
+                for t in range(n_terms):
+                    change = d_scatter[t] * (restricted[t, p] - lagged[t, p])
+                    start = starts[t, p]
+                    for c in range(first[t, p], last[t, p]):
+                        coarse_source[c] += change * values[start + c - first[t, p]]
         if k > 0:
             for t in range(n_terms):
                 sigma = scatter[t]
                 w = weights[k - 1]
                 running[t, k] += flux[k] * (sigma[k - 1] * w[1] + sigma[k] * w[3]) / energy[k - 1]
-    return flux, diagonal
+                s = slot[t]
+                if s >= 0:
+                    a = flux[k - 1]
+                    b = flux[k]
+                    for p in range(3):
+                        w = moment_weights[p, k - 1]
+                        moments[s, p, k] = (
+                            moments[s, p, k - 1]
+                            + (
+                                sigma[k - 1] * (w[0] * a + w[1] * b)
+                                + sigma[k] * (w[2] * a + w[3] * b)
+                            )
+                            / energy[k - 1] ** p
+                        )
+    return flux, diagonal, restricted
 
 
-def solve_energy(ops, removal, scatter, streaming, source):
-    """Solve for F. removal is (terms), scatter is (terms, orders), source is (energies)."""
+@njit
+def _lagged_source(d_scatter, lagged, starts, first, last, values, n_coarse):
+    out = np.zeros(n_coarse)
+    for t in range(lagged.shape[0]):
+        for j in range(n_coarse):
+            change = d_scatter[t] * lagged[t, j]
+            for c in range(first[t, j], last[t, j]):
+                out[c] += change * values[starts[t, j] + c - first[t, j]]
+    return out
+
+
+def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable"):
+    """Solve for F. removal is (terms), scatter is (terms, orders), source is (energies).
+
+    anisotropy is "separable" (elastic.separable_correction) or "direct", the oracle's direct sum.
+    """
+    if anisotropy not in ("separable", "direct"):
+        raise ValueError(f"anisotropy must be 'separable' or 'direct', not {anisotropy!r}")
     removal = np.asarray(removal, dtype=float)
     scatter = np.asarray(scatter, dtype=float)
     source = np.asarray(source, dtype=float)
@@ -229,22 +380,57 @@ def solve_energy(ops, removal, scatter, streaming, source):
             f"shape: removal {removal.shape}, scatter {scatter.shape} and source {source.shape} "
             f"do not fit {n_terms} terms and {n} energies"
         )
-    flux, diagonal = _march(
-        ops.energy,
-        ops.removal,
-        ops.scatter,
-        ops.alpha,
-        ops.emission_weights,
-        removal,
-        scatter[:, 0],
-        float(streaming),
-        source,
-        ops.angle.tables,
-        ops.angle.table_energy,
-        ops.angle.points,
-        ops.angle.mu,
-        ops.angle.pdf,
-        ops.angle.cutoff,
-        ops.angle.peak,
-    )
-    return EnergySolution(flux, diagonal)
+    kernels = ops.inelastic
+    lagged = np.zeros((n_terms, kernels.coarse.shape[0]))
+    for sweep in range(1, MAX_SWEEPS + 1):
+        coarse_source = _lagged_source(
+            scatter[:, 0],
+            lagged,
+            kernels.starts,
+            kernels.first,
+            kernels.last,
+            kernels.values,
+            kernels.coarse.shape[0],
+        )
+        flux, diagonal, restricted = _march(
+            ops.energy,
+            ops.removal,
+            ops.scatter,
+            ops.alpha,
+            ops.emission_weights,
+            removal,
+            scatter[:, 0],
+            float(streaming),
+            source,
+            ops.angle.tables,
+            ops.angle.table_energy,
+            ops.angle.points,
+            ops.angle.mu,
+            ops.angle.pdf,
+            ops.angle.cutoff,
+            ops.angle.peak,
+            ops.rate_weights,
+            kernels.emission,
+            kernels.hat,
+            kernels.coarse_index,
+            ops.panel_m,
+            ops.panel_share,
+            ops.node_m,
+            ops.node_theta,
+            kernels.starts,
+            kernels.first,
+            kernels.last,
+            kernels.values,
+            lagged,
+            coarse_source,
+            anisotropy == "separable",
+            ops.moment_weights,
+        )
+        scale = np.abs(restricted).max()
+        if (
+            kernels.values.shape[0] == 0
+            or np.abs(restricted - lagged).max() <= SWEEP_TOLERANCE * scale
+        ):
+            return EnergySolution(flux, diagonal, sweep)
+        lagged = restricted
+    raise RuntimeError(f"inelastic sweeps did not converge in {MAX_SWEEPS}")

@@ -1,7 +1,7 @@
 # Study 02: Fixed-source slowing down with real data
 
-Status: part 1 (elastic only) done. Part 2 (a high-energy source, with inelastic scattering) waits
-for milestone M3.
+Status: done. Part 1 is elastic scattering only; part 2 starts the same media at 14 MeV, so that
+inelastic scattering and (n,xn) join it (milestone M3).
 
 ## Question
 
@@ -62,9 +62,10 @@ so they are slower than a lone run: 16 s against 25 s for light at subdivide 1.
   downstream as a gain. The M2 review measured the flux error against the cumulative bulge above
   each energy: +3.71e-3 and +3.57e-3 at 25 eV in the isotropic light case. 200 of 18,000 panels hold
   60% of it, so inserting nodes by bulge should cost far less than uniform subdivision (study 04).
-- **Speed:** the anisotropic part is a direct sum over each window, so time grows with the square of
-  the node count. Heavy takes 7742 s at 544k nodes with two terms, about 800 times the 10 s target.
-  M9 has to replace it.
+- **Speed:** the anisotropic part was a direct sum over each window, so time grew with the square of
+  the node count: 7742 s for heavy at 544k nodes, about 800 times the 10 s target. Decision 006
+  replaced it with running moments, which take 1.5 to 2.6 s there and give the same captures to
+  7e-8. The times in the table are the direct sum's, which stays as the oracle.
 - **Largest single bin:** the worst heavy flux bin differs by 3.4%, at z under 4.7, in a low-flux bin
   with a large tally error.
 
@@ -82,8 +83,58 @@ Unit tests with synthetic data passed through all of these:
 - Numba's cache kept a stale kernel across files; see decision 005.
 - An earlier heavy result of +0.025% came from the normalization bug, and it was a coincidence.
 
+## Part 2: from 14 MeV
+
+### Method
+
+The same two media, light-fast and heavy-fast, with a 14 MeV point source. Inelastic and (n,xn)
+scattering go through the coarse transfer of decision 007 at its default spacing of 0.00125. Twins
+run 8e7 histories each, with the part 1 settings.
+
+```bash
+pixi run python run_case.py heavy-fast 1e-3 2
+```
+
+### Result
+
+| Case | Subdivide | Nodes | Kernels | Solve | Residual / source | Capture vs twin | Flux rms z |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| light-fast | 1 | 58,252 | 379 s | 40 s | -3.2e-3 | Fe56 +0.338%, Na23 +0.315% | 10.0 |
+| light-fast | 2 | 105,199 | 378 s | 122 s | -1.0e-3 | Fe56 +0.104%, Na23 +0.096% | 3.19 |
+| light-fast | 4 | 199,093 | 372 s | 415 s | -3.0e-4 | Fe56 +0.027%, Na23 +0.022% | 1.30 |
+| heavy-fast | 1 | 195,979 | 784 s | 56 s | -1.2e-3 | U238 +0.148% | 2.87 |
+| heavy-fast | 2 | 380,653 | 780 s | 180 s | -3.1e-4 | U238 +0.052% | 1.38 |
+| heavy-fast | 4 | 750,001 | 775 s | 750 s | -7.7e-5 | U238 +0.028% | 1.16 |
+
+Twin uncertainty is 0.011% on Fe56 capture, 0.009% on Na23 and 0.016% on U238. Flux bins have a
+median uncertainty of 0.03% (light) and 0.08% (heavy). Four cases ran at once, and every solve
+converged in 2 lagged sweeps.
+
+- **Accuracy:** both cases converge to OpenMC at second order, as in part 1. The leading error is
+  still elastic slowing down at low energy: apart from heavy-fast's 12.99 MeV bin, the worst bins at
+  subdivide 1 and 2 lie below 20 keV. The 0.2% rate target needs subdivide 2.
+- **Coarse spacing:** first order, and it was the largest error above 1 MeV at the old default of
+  0.0025: -0.9% (z -6.6) in the 7.68 MeV bin of heavy-fast. Decision 007 has the convergence table.
+- **Open bins:** heavy-fast's 3.28 MeV (+0.34%) and 12.99 MeV (-0.30%) bins stay at z near 3.4 for
+  every setting tried. See decision 007 for what is ruled out. Against the original 2e7-history twin,
+  12.99 MeV looked twice as far off (-0.68%, z -4.6). A second seed and a fourfold rerun showed that
+  twin 0.37% high there, 2.5 of its sd, so the twins were rerun at 8e7.
+- **Speed:** kernels cost 6 to 13 minutes and are cached by grid, and solves take 40 to 750 s. Both
+  are far from the 10 s target. Decision 006 found that above 100 keV its quadrature fallback carries
+  most elastic segments, which is the likely cost here; it has not been profiled for these cases.
+
+### Errors this part caught
+
+- Point masses for strata quantized the source once hats were narrower than their spacing. Strata
+  are now lab-energy segments.
+- Rows built only from reactions above threshold at the hat's node lost 7e-5 of the source in hats
+  straddling a threshold. They now weight reactions by hat integrals at centroids.
+- Spacing strata by the narrowest hat made kernels 58 times slower, from a 1e-6 sliver between two
+  thresholds.
+
 ## Decision
 
-Elastic slowing down with real data meets the gate's accuracy, at about 35k (light) and 270k (heavy)
-nodes for 0.2% rates. Cost is now the main open risk, and the residual gate needs flux-driven node
-insertion. Part 2 follows M3.
+Slowing down with real data, from 14 MeV through inelastic scattering and (n,xn), meets the gate's
+accuracy at subdivide 2: rates within 0.11% for light-fast and 0.06% for heavy-fast, at about 100k
+and 380k nodes. Cost is the main open risk. Kernel setup, the solve above 100 keV, and dense
+coarse matrices all go to M9, and the residual gate needs flux-driven node insertion (study 04).

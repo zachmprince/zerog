@@ -8,6 +8,7 @@ from numba import njit
 
 from zerog.energy.elastic import angle_pdf
 from zerog.energy.grid import _GAUSS_S, _GAUSS_W, _weights, panel_rate
+from zerog.energy.inelastic import restrict
 
 BELOW_POINTS = 64  # midpoints across the cosines that land below the grid
 
@@ -53,8 +54,8 @@ def _lost_below(energy, sigma, alpha, flux, nodes, node_weights):
             flux_upper = (1.0 - t) * flux[i] + t * flux[i + 1]
             upper = edge
         h = math.log(upper / lower)
-        r = _weights(h, False, nodes, node_weights)
-        e = _weights(h, True, nodes, node_weights)
+        r = _weights(h, 0, nodes, node_weights)
+        e = _weights(h, 1, nodes, node_weights)
         rate = sigma_upper * (r[0] * flux_upper + r[1] * flux[i + 1]) + sigma[i + 1] * (
             r[2] * flux_upper + r[3] * flux[i + 1]
         )
@@ -132,4 +133,10 @@ def energy_balance(ops, removal, scatter, streaming, source, flux):
                 ops.angle.mu,
                 ops.angle.pdf,
             )
+    kernels = ops.inelastic
+    if kernels.values.shape[0] > 0:
+        restricted = restrict(kernels, ops.energy, flux, ops.rate_weights)
+        for t in range(ops.removal.shape[0]):
+            emitted += scatter[t, 0] * restricted[t].sum()
+            lost += scatter[t, 0] * float(restricted[t] @ kernels.lost[t])
     return Balance(src, emitted, removed, lost, src + emitted - removed - lost)
