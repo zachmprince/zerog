@@ -18,7 +18,35 @@ SFR = {
     "Cr52": 3.888e-3,
     "Ni58": 2.432e-3,
 }
-CASES = {"sfr": {"densities": SFR, "temperature": 900.0}}
-TEMPERATURE = "900K"
-ENERGY_MIN = 50.0  # eV, above OpenMC's free gas threshold of 400 kT, 31 eV at 900 K
+
+# A homogenized pressurized water reactor cell: 30% UO2 at 10.4 g/cm3 and 4.0 wt% U235, 60% water
+# at 0.70 g/cm3 (15.5 MPa and 600 K) and 10% zirconium at 6.55 g/cm3, all Zr90. Atoms/b-cm.
+PWR = {
+    "U235": 2.824e-4,
+    "U238": 6.677e-3,
+    "O16": 2.796e-2,
+    "H1": 2.808e-2,
+    "Zr90": 4.388e-3,
+}
+
+# energy_min is where both codes kill neutrons, None for no cutoff (ZeroG's grid then ends at the
+# library's bottom, 1e-5 eV). sab maps a nuclide to its S(alpha, beta) table.
+CASES = {
+    "sfr": {
+        "densities": SFR,
+        "temperature": 900.0,
+        "label": "900K",
+        # Above OpenMC's free gas threshold of 400 kT, 31 eV at 900 K.
+        "energy_min": 50.0,
+        "sab": {},
+    },
+    "pwr": {
+        "densities": PWR,
+        "temperature": 600.0,
+        "label": "600K",
+        "energy_min": None,
+        "sab": {"H1": "c_H_in_H2O"},
+    },
+}
+LIBRARY_BOTTOM = 1.0e-5  # eV
 FLUX_BINS_PER_LETHARGY = 20

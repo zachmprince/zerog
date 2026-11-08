@@ -1,4 +1,6 @@
-"""ZeroG side of study 03. Usage: run_k.py <case> [rtol] [subdivide]. Compares with the twin."""
+"""ZeroG side of study 03. Usage: run_k.py <case> [rtol] [subdivide] [light]. Compares with the
+twin. light sets the free gas threshold, in kT, for targets of awr <= 1, which OpenMC treats as free
+gas at every energy; zerog.energy.thermal.LIGHT_FREE_GAS_THRESHOLD by default."""
 
 import json
 import sys
@@ -6,7 +8,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-from cases import CASES, ENERGY_MIN, TEMPERATURE
+from cases import CASES, LIBRARY_BOTTOM
 
 from zerog.data.neutron import MT_FISSION, MT_PARTIAL_FISSION, read_reactions
 from zerog.energy.balance import energy_balance
@@ -21,38 +23,74 @@ from zerog.energy.fission import (
 from zerog.energy.grid import interpolate, panel_rate
 from zerog.energy.inelastic import build_inelastic
 from zerog.energy.subproblem import build_operators
-from zerog.energy.terms import awr, load_term, transport_grid
+from zerog.energy.terms import (
+    apply_thermal,
+    awr,
+    load_term,
+    thermal_grid_settings,
+    thermal_required,
+    thermal_spec,
+    transport_grid,
+)
+from zerog.energy.thermal import build_thermal
 
 TWIN = Path(__file__).parents[3] / "benchmarks" / "05-fast-k-infinity"
 CACHE = Path(__file__).parent / "results" / "kernels"
 
 
-def fission_xs(name, energy):
-    data = read_reactions(name, TEMPERATURE)
+def fission_xs(name, label, energy):
+    data = read_reactions(name, label)
     selected = data.xs[np.isin(data.mt, (MT_FISSION, *MT_PARTIAL_FISSION))].sum(axis=0)
     return interpolate(energy, data.energy, selected)
 
 
-def run(name, rtol=1e-3, subdivide=1):
+def run(name, rtol=1e-3, subdivide=1, light=None):
     case = CASES[name]
     densities = case["densities"]
-    nuclides = [(n, TEMPERATURE) for n in densities]
+    label = case["label"]
+    energy_min = case["energy_min"] or LIBRARY_BOTTOM
+    nuclides = [(n, label) for n in densities]
     top = data_top(nuclides)
     summary = json.loads((TWIN / f"{name}.json").read_text())
     edges = np.array(summary["edges_low"])
-    required = np.concatenate([fission_nodes(nuclides, top, ENERGY_MIN), edges[edges > ENERGY_MIN]])
-    grid, coarse = transport_grid(
-        nuclides, rtol, 1e-8, top, ENERGY_MIN, subdivide, required=required
+    # Thermal scattering, where the grid reaches below a free gas top.
+    specs = [
+        thermal_spec(n, label, case["sab"].get(n), light if awr(n) <= 1.0 else None)
+        for n in densities
+    ]
+    specs = [s if energy_min < s.free_top else None for s in specs]
+    thermal = [s for s in specs if s is not None]
+    required = np.concatenate(
+        [
+            fission_nodes(nuclides, top, energy_min),
+            edges[edges > energy_min],
+            *[thermal_required(s, energy_min) for s in thermal],
+        ]
     )
-    terms = [load_term(n, TEMPERATURE, grid) for n in densities]
+    grid, coarse = transport_grid(
+        nuclides,
+        rtol,
+        1e-8,
+        top,
+        energy_min,
+        subdivide,
+        required=required,
+        thermal=thermal_grid_settings(thermal) if thermal else None,
+    )
+    terms = [load_term(n, label, grid) for n in densities]
+    terms = [
+        t if s is None else apply_thermal(t, s, grid) for t, s in zip(terms, specs, strict=True)
+    ]
     d = np.array([densities[n] for n in densities])
     start = time.perf_counter()
     inelastic = build_inelastic(
-        [(n, TEMPERATURE, awr(n)) for n in densities],
+        [(n, label, awr(n)) for n in densities],
         grid,
         coarse,
         cache=CACHE,
     )
+    if thermal:
+        inelastic = build_thermal(specs, grid, inelastic, cache=CACHE)
     fission = build_fission(nuclides, grid, coarse, top)
     kernels = time.perf_counter() - start
     ops = build_operators(
@@ -74,7 +112,8 @@ def run(name, rtol=1e-3, subdivide=1):
     k_twin, k_std = summary["k"], summary["k_std"]
     print(
         f"{name}: {grid.shape[0]} nodes, kernels {kernels:.0f} s, solve {elapsed:.0f} s, "
-        f"{solution.iterations} iterations, {solution.sweeps} sweeps, residual/source {closure:.2e}"
+        f"{solution.iterations} iterations, {solution.sweeps} sweeps, "
+        f"{solution.block_marches} block marches, residual/source {closure:.2e}"
     )
     print(
         f"  k {solution.k:.6f} vs {k_twin:.6f} +- {k_std:.6f}: "
@@ -87,7 +126,7 @@ def run(name, rtol=1e-3, subdivide=1):
     flux_twin = solution.k * flux
     curves = {
         "(n,gamma)": lambda i: terms[i].capture,
-        "fission": lambda i: fission_xs(terms[i].name, grid),
+        "fission": lambda i: fission_xs(terms[i].name, label, grid),
     }
     produced = production_rates(fission, d, grid, flux_twin, ops.rate_weights)
     for row in summary["rates"]:
@@ -120,11 +159,14 @@ def run(name, rtol=1e-3, subdivide=1):
         ours[b] = np.sum(
             0.5 * (flux_twin[mask][:-1] + flux_twin[mask][1:]) * np.log(piece[:-1] / piece[1:])
         )
-    z = (ours - twin) / std
-    relative = ours / twin - 1.0
+    # Bins at the ends can be empty in the twin.
+    tallied = std > 0.0
+    z = np.where(tallied, (ours - twin) / np.where(tallied, std, 1.0), 0.0)
+    relative = np.where(tallied, ours / np.where(tallied, twin, 1.0) - 1.0, 0.0)
     print(
-        f"  flux bins {low.shape[0]}: rms z {np.sqrt(np.mean(z**2)):.2f}, "
-        f"max |z| {np.abs(z).max():.1f}, median sd {np.median(std / twin) * 100:.3f}%"
+        f"  flux bins {tallied.sum()} of {low.shape[0]} tallied: "
+        f"rms z {np.sqrt(np.mean(z[tallied] ** 2)):.2f}, max |z| {np.abs(z).max():.1f}, "
+        f"median sd {np.median(std[tallied] / twin[tallied]) * 100:.3f}%"
     )
     for b in np.argsort(np.abs(z))[-3:]:
         print(f"    bin {low[b]:.4g}-{high[b]:.4g} eV: {relative[b] * 100:+.3f}%, z {z[b]:+.1f}")
@@ -134,4 +176,9 @@ def run(name, rtol=1e-3, subdivide=1):
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    run(args[0], float(args[1]) if len(args) > 1 else 1e-3, int(args[2]) if len(args) > 2 else 1)
+    run(
+        args[0],
+        float(args[1]) if len(args) > 1 else 1e-3,
+        int(args[2]) if len(args) > 2 else 1,
+        float(args[3]) if len(args) > 3 else None,
+    )

@@ -27,6 +27,7 @@ class EigenSolution:
     iterations: int
     sweeps: int
     history: np.ndarray  # k after each iteration
+    block_marches: int = 0
 
 
 def solve_k(ops, fission, removal, scatter, streaming, production, anisotropy="separable"):
@@ -46,6 +47,7 @@ def solve_k(ops, fission, removal, scatter, streaming, production, anisotropy="s
     shape, _ = fission_hats(fission, production, ops.energy, flux, ops.rate_weights)
     history = []
     sweeps = 0
+    marches = 0
     for iteration in range(1, MAX_ITERATIONS + 1):
         source = fission_source(ops, fission, production, flux) / k
         # The last flux's inelastic emission starts the lagged sweeps, since it changes little.
@@ -54,6 +56,7 @@ def solve_k(ops, fission, removal, scatter, streaming, production, anisotropy="s
         )
         solution = solve_energy(ops, removal, scatter, streaming, source, anisotropy, initial)
         sweeps += solution.sweeps
+        marches += solution.block_marches
         produced = production_rates(
             fission, production, ops.energy, solution.flux, ops.rate_weights
         ).sum()
@@ -64,7 +67,7 @@ def solve_k(ops, fission, removal, scatter, streaming, production, anisotropy="s
         history.append(k_new)
         change = np.abs(new_shape - shape).max() / np.abs(new_shape).max()
         if abs(k_new - k) <= K_TOLERANCE * k_new and change <= SOURCE_TOLERANCE:
-            return EigenSolution(k_new, flux, iteration, sweeps, np.array(history))
+            return EigenSolution(k_new, flux, iteration, sweeps, np.array(history), marches)
         k = k_new
         shape = new_shape
     raise RuntimeError(f"power iteration did not converge in {MAX_ITERATIONS} iterations")

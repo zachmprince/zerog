@@ -1,10 +1,10 @@
-"""OpenMC twin of study 03: k-infinity of a homogenized fast reactor mix.
+"""OpenMC twin of study 03: k-infinity of a homogenized reactor mix.
 
 Usage: build.py <case> <particles per batch> <active batches> [nocut]. An infinite medium (a
-reflective box) at one temperature, with probability tables off and neutrons killed below
-ENERGY_MIN, as ZeroG's grid ends there. With nocut the cutoff is left at OpenMC's default, to
-measure what it costs. Results go to results/<case>/, gitignored apart from the small summary in
-<case>[-nocut].json.
+reflective box) at one temperature, with probability tables off and neutrons killed below the
+case's energy_min, if it has one, as ZeroG's grid ends there. With nocut the cutoff is left at
+OpenMC's default, to measure what it costs. Results go to results/<case>/, gitignored apart from
+the small summary in <case>[-nocut].json.
 """
 
 import hashlib
@@ -19,7 +19,7 @@ import openmc
 HERE = Path(__file__).parent
 STUDY = HERE.parents[1] / "studies" / "03-k-infinity" / "scripts"
 sys.path.insert(0, str(STUDY))
-from cases import CASES, ENERGY_MIN, FLUX_BINS_PER_LETHARGY  # noqa: E402
+from cases import CASES, FLUX_BINS_PER_LETHARGY, LIBRARY_BOTTOM  # noqa: E402
 
 SEED = 20261107
 INACTIVE = 20
@@ -33,6 +33,8 @@ def build(name, particles, active, cut=True):
         material.add_nuclide(nuclide, density)
     material.set_density("atom/b-cm", sum(case["densities"].values()))
     material.temperature = case["temperature"]
+    for table in case["sab"].values():
+        material.add_s_alpha_beta(table)
 
     box = openmc.model.RectangularParallelepiped(
         -50, 50, -50, 50, -50, 50, boundary_type="reflective"
@@ -48,14 +50,16 @@ def build(name, particles, active, cut=True):
     settings.photon_transport = False
     settings.ptables = False
     settings.temperature = {"method": "nearest", "tolerance": 1.0}
-    if cut:
-        settings.cutoff = {"energy_neutron": ENERGY_MIN}
+    energy_min = case["energy_min"]
+    if cut and energy_min is not None:
+        settings.cutoff = {"energy_neutron": energy_min}
     settings.source = openmc.IndependentSource(
         space=openmc.stats.Point((0, 0, 0)), energy=openmc.stats.Watt()
     )
 
-    n_bins = int(np.log(ENERGY_MAX / ENERGY_MIN) * FLUX_BINS_PER_LETHARGY)
-    edges = np.geomspace(ENERGY_MIN, ENERGY_MAX, n_bins + 1)
+    bottom = LIBRARY_BOTTOM if energy_min is None else energy_min
+    n_bins = int(np.log(ENERGY_MAX / bottom) * FLUX_BINS_PER_LETHARGY)
+    edges = np.geomspace(bottom, ENERGY_MAX, n_bins + 1)
     flux = openmc.Tally(name="flux")
     flux.filters = [openmc.EnergyFilter(edges)]
     flux.scores = ["flux"]
@@ -97,7 +101,7 @@ def main():
                 "particles": particles,
                 "batches": INACTIVE + active,
                 "inactive": INACTIVE,
-                "cutoff": ENERGY_MIN if cut else None,
+                "cutoff": CASES[name]["energy_min"] if cut else None,
                 "date": datetime.now(UTC).isoformat(timespec="seconds"),
             },
             "k": sp.keff.nominal_value,

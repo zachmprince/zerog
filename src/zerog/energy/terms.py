@@ -10,6 +10,15 @@ from zerog.data.scatter import read_scattering_laws
 from zerog.energy.elastic import refine_for_angle
 from zerog.energy.grid import assemble_grid, interpolate, kinematic_alpha, node_pairs
 from zerog.energy.inelastic import coarse_grid
+from zerog.energy.thermal import (
+    FREE_GAS_THRESHOLD,
+    LIGHT_FREE_GAS_THRESHOLD,
+    ThermalTerm,
+    emission_curve,
+    free_gas_range,
+    sab_table,
+    thermal_coarse,
+)
 
 
 @dataclass(frozen=True)
@@ -45,14 +54,27 @@ COARSE_DU = 0.00125
 
 
 def transport_grid(
-    nuclides, rtol, atol, energy_max, energy_min, subdivide=1, coarse_du=COARSE_DU, required=()
+    nuclides,
+    rtol,
+    atol,
+    energy_max,
+    energy_min,
+    subdivide=1,
+    coarse_du=COARSE_DU,
+    required=(),
+    thermal=None,
 ):
     """A fine grid as elastic_grid, holding a coarse grid for inelastic transfer. Returns both.
 
-    required energies, such as zerog.energy.fission.fission_nodes, become fine nodes.
+    required energies, such as zerog.energy.fission.fission_nodes, become fine nodes. thermal,
+    (reach, kT, awr) from thermal_grid_settings, widens coarse hats below reach as
+    zerog.energy.thermal.thermal_coarse does.
     """
     fine = elastic_grid(nuclides, rtol, atol, energy_max, energy_min, subdivide, required)
     coarse = coarse_grid(fine, coarse_du, _thresholds(nuclides, energy_max, energy_min))
+    if thermal is not None:
+        thresholds = _thresholds(nuclides, energy_max, energy_min)
+        coarse = thermal_coarse(coarse, *thermal, coarse_du, required=thresholds)
     return np.unique(np.concatenate([fine, coarse]))[::-1], coarse
 
 
@@ -113,4 +135,102 @@ def load_term(name, temperature, energy):
         elastic=curve((MT_ELASTIC,)),
         capture=curve((MT_CAPTURE,)),
         angle=_elastic_angle(name),
+    )
+
+
+def library_kT(name, label):
+    """A nuclide's kT at a library temperature label, in eV."""
+    import h5py
+
+    from zerog.data.library import nuclide_path
+
+    with h5py.File(nuclide_path(name), "r") as f:
+        return float(f[name]["kTs"][label][()])
+
+
+def thermal_spec(name, label, sab=None, threshold=None):
+    """The ThermalTerm of a nuclide at a library temperature: free gas below threshold * kT, and
+    the S(alpha, beta) table sab (such as 'c_H_in_H2O', at the same label) below its energy_max.
+
+    threshold defaults to OpenMC's 400, or LIGHT_FREE_GAS_THRESHOLD for awr <= 1.
+    """
+    from zerog.data.thermal import read_thermal
+
+    if threshold is None:
+        threshold = LIGHT_FREE_GAS_THRESHOLD if _awr(name) <= 1.0 else FREE_GAS_THRESHOLD
+
+    data = read_reactions(name, label)
+    kT = library_kT(name, label)
+    elastic = data.xs[list(data.mt).index(MT_ELASTIC)]
+    if sab is None:
+        return ThermalTerm(_awr(name), kT, threshold * kT, data.energy, elastic)
+    table = read_thermal(sab, label)
+    if threshold * kT <= table.energy_max:
+        raise ValueError(
+            f"{name}'s free gas top {threshold * kT} eV is at or below {sab}'s energy_max "
+            f"{table.energy_max} eV: free gas would never apply"
+        )
+    if name not in table.nuclides:
+        raise ValueError(f"{sab} is for {table.nuclides}, not {name}")
+    if abs(table.kT - kT) > 1e-6 * kT:
+        raise ValueError(f"{sab} at {label} has kT {table.kT}, {name} has {kT}")
+    return ThermalTerm(
+        awr=_awr(name),
+        kT=kT,
+        free_top=threshold * kT,
+        curve_energy=data.energy,
+        elastic=elastic,
+        sab_top=table.energy_max,
+        sab=sab_table(table),
+        sab_energy=table.energy,
+        sab_xs=table.xs,
+    )
+
+
+def thermal_required(spec, energy_min):
+    """Fine nodes a thermal term needs: node pairs at its tops, where cross sections jump, and its
+    S(alpha, beta) cross section's own energies."""
+    # Free gas stops below free_top (OpenMC takes E >= 400 kT at rest), the table at sab_top
+    # inclusive (E <= energy_max), so that pair sits just above it.
+    out = [node_pairs([spec.free_top])]
+    if spec.sab is not None:
+        out.append(np.array([spec.sab_top * (1.0 + 1e-10), spec.sab_top]))
+    if spec.sab is not None:
+        e = spec.sab_energy
+        out.append(e[(e < spec.sab_top) & (e > energy_min)])
+    return np.concatenate(out)
+
+
+def thermal_grid_settings(specs):
+    """(reach, kT, awr) for transport_grid: thermal rows reach up to the free gas kernel's top
+    from the highest thermal top, and the heaviest free gas target has the narrowest kernel."""
+    specs = [s for s in specs if s is not None]
+    reach = max(free_gas_range(s.free_top, s.awr, s.kT)[1] for s in specs)
+    return reach, max(s.kT for s in specs), max(s.awr for s in specs)
+
+
+def apply_thermal(term, spec, energy):
+    """A TermData with thermal scattering: its elastic is the target-at-rest part, above free_top,
+    and its total takes the S(alpha, beta) cross section in place of elastic below sab_top."""
+    at_rest = np.where(energy >= spec.free_top, term.elastic, 0.0)
+    total = term.total
+    if spec.sab is not None:
+        bound = np.interp(energy[::-1], spec.sab_energy[::-1], spec.sab_xs[::-1])[::-1]
+        below = energy <= spec.sab_top
+        total = np.where(below, total - term.elastic + bound, total)
+    # Check the split: at-rest plus thermal emission is the elastic, or the table, everywhere.
+    scattering = at_rest + emission_curve(spec, energy)
+    expected = term.elastic
+    if spec.sab is not None:
+        expected = np.where(energy <= spec.sab_top, bound, term.elastic)
+    if not np.allclose(scattering, expected, rtol=1e-12, atol=0.0):
+        raise ValueError(f"{term.name}: thermal and at-rest scattering do not add to the whole")
+    return TermData(
+        name=term.name,
+        temperature=term.temperature,
+        alpha=term.alpha,
+        total=total,
+        elastic=at_rest,
+        capture=term.capture,
+        angle=term.angle,
     )

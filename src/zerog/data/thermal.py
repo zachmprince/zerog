@@ -32,6 +32,8 @@ class ThermalData:
     and ends at 1, unlike spectrum.cdf.
 
     temperature is the library's label, not a value ('294K' is 293.6 K), so use kT for physics.
+    energy_max is where OpenMC stops using the table (E <= energy_max), which need not be the top
+    of xs.
     """
 
     name: str
@@ -39,6 +41,7 @@ class ThermalData:
     nuclides: tuple[str, ...]
     temperature: str
     kT: float  # eV
+    energy_max: float  # eV
     energy: np.ndarray
     xs: np.ndarray
     spectrum: TabularSpectrum
@@ -118,6 +121,7 @@ def read_thermal(name, temperature):
             nuclides=tuple(n.decode() for n in group.attrs["nuclides"]),
             temperature=temperature,
             kT=float(group["kTs"][temperature][()]),
+            energy_max=float(group.attrs["energy_max"]),
             energy=energy,
             xs=xs,
             spectrum=TabularSpectrum(

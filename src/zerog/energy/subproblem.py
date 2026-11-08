@@ -6,7 +6,7 @@ Y[t, l] is the emission density per unit lethargy of term t and Legendre order l
 per unit lethargy as well. Densities and the streaming coefficient a can be negative. The equation
 is collocated at the nodes, and the implicit part of each node's own panel moves to the left.
 
-Only order 0 of target-at-rest elastic scattering exists so far.
+Only order 0 scattering exists so far.
 """
 
 from dataclasses import dataclass
@@ -26,9 +26,12 @@ from zerog.energy.elastic import (
 )
 from zerog.energy.grid import MAX_PANEL, centred_weights, emission_weights, rate_weights
 from zerog.energy.inelastic import InelasticKernels, no_inelastic, panel_hats
+from zerog.linalg import solve
 
 MAX_SWEEPS = 50
 SWEEP_TOLERANCE = 1e-12  # on the hats' emission, relative to the largest
+BLOCK_RESTARTS = 20  # GMRES restart cycles per block solve
+BLOCK_RTOL = 1e-10  # GMRES stop relative to the block's right-hand side
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,7 @@ class EnergySolution:
     flux: np.ndarray
     diagonal: np.ndarray
     sweeps: int = 1
+    block_marches: int = 0  # marches of the upscatter block, inside its Krylov solves
 
 
 def build_operators(energy, removal, scatter, alpha, angle=None, inelastic=None):
@@ -187,8 +191,9 @@ def _march(
     coarse_source,
     separable,
     moment_weights,
+    start,
 ):
-    """Forward substitution over the nodes.
+    """Forward substitution over the nodes from start, with F zero above it.
 
     Inelastic emission is restricted to coarse hats as each panel completes. A hat's row goes to
     coarse_source once the march leaves the hat, replacing its lagged value; what lands in hats not
@@ -200,11 +205,15 @@ def _march(
 
     If separable, anisotropic terms keep a tree of centred panel moments, for
     separable_correction; otherwise they take the direct sum, anisotropic_correction.
+
+    Every running sum is linear in the F above it, so with F zero above start, marching from start
+    with empty sums is the whole march. The block solve uses that for sources that only reach
+    below start.
     """
     n_terms = removal.shape[0]
     n = energy.shape[0]
-    flux = np.empty(n)
-    diagonal = np.empty(n)
+    flux = np.zeros(n)
+    diagonal = np.zeros(n)
     running = np.zeros((n_terms, n))
     pointer = np.zeros(n_terms, dtype=np.int64)
     block_start = np.zeros(n_terms, dtype=np.int64)
@@ -231,7 +240,7 @@ def _march(
     size = moment_tree_size(tree_panels + 1)
     widths = np.log(energy[:-1] / energy[1:])
     trees = np.zeros((n_slots, 2 * size if n_slots > 0 else 0, 4))
-    for k in range(n):
+    for k in range(start, n):
         lhs = streaming
         rhs = source[k]
         for t in range(n_terms):
@@ -330,9 +339,9 @@ def _march(
                 # Hat p is complete: send its emission, less what the lagged pass already sent.
                 for t in range(n_terms):
                     change = d_scatter[t] * (restricted[t, p] - lagged[t, p])
-                    start = starts[t, p]
+                    row_start = starts[t, p]
                     for c in range(first[t, p], last[t, p]):
-                        coarse_source[c] += change * values[start + c - first[t, p]]
+                        coarse_source[c] += change * values[row_start + c - first[t, p]]
         if k > 0:
             for t in range(n_terms):
                 sigma = scatter[t]
@@ -356,12 +365,36 @@ def _lagged_source(d_scatter, lagged, starts, first, last, values, n_coarse):
     return out
 
 
+def upscatter_block(kernels):
+    """The first coarse hat of the block solved by Krylov, and the fine node its rows reach up to.
+
+    The block starts at the highest hat whose row reaches above its upper neighbour, which only
+    thermal scattering does, and runs to the bottom. None if no row reaches up.
+    """
+    n = kernels.coarse.shape[0]
+    filled = kernels.last > kernels.first
+    upward = filled & (kernels.first < np.arange(n)[None, :] - 1)
+    if not upward.any():
+        return None
+    first_hat = int(np.nonzero(upward.any(axis=0))[0].min())
+    reach = int(kernels.first[:, first_hat:][filled[:, first_hat:]].min())
+    # Nodes in interval m take a share of hat m + 1, so a deposit in hat reach drives F from the
+    # top of interval reach - 1.
+    return first_hat, int(kernels.coarse_index[max(reach - 1, 0)])
+
+
 def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable", initial=None):
     """Solve for F. removal is (terms), scatter is (terms, orders), source is (energies).
 
     anisotropy is "separable" (elastic.separable_correction) or "direct", the oracle's direct sum.
     initial is a first guess of the lagged inelastic emission, (terms, coarse nodes) as
     zerog.energy.inelastic.restrict gives it, such as that of a previous flux; zero by default.
+
+    Each sweep marches the whole grid with the emission of hats not yet passed lagged. Hats above
+    the upscatter block then take the sweep's emission. Hats in the block take the exact solution
+    of their own lagged problem given the rest, by GMRES on the lagged emission, with marches from
+    the block's top as the operator: a march is Gauss-Seidel, so this is GMRES preconditioned by
+    the downward sweep. Sweeps end when one reproduces the emission it was given.
     """
     if anisotropy not in ("separable", "direct"):
         raise ValueError(f"anisotropy must be 'separable' or 'direct', not {anisotropy!r}")
@@ -377,14 +410,14 @@ def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable
             f"do not fit {n_terms} terms and {n} energies"
         )
     kernels = ops.inelastic
-    lagged = np.zeros((n_terms, kernels.coarse.shape[0]))
+    n_coarse = kernels.coarse.shape[0]
+    lagged = np.zeros((n_terms, n_coarse))
     if initial is not None:
         lagged = np.array(initial, dtype=float)
-        if lagged.shape != (n_terms, kernels.coarse.shape[0]):
-            raise ValueError(
-                f"shape: initial {lagged.shape} must be {(n_terms, kernels.coarse.shape[0])}"
-            )
-    for sweep in range(1, MAX_SWEEPS + 1):
+        if lagged.shape != (n_terms, n_coarse):
+            raise ValueError(f"shape: initial {lagged.shape} must be {(n_terms, n_coarse)}")
+
+    def sweep(source, lagged, start):
         coarse_source = _lagged_source(
             scatter[:, 0],
             lagged,
@@ -392,9 +425,9 @@ def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable
             kernels.first,
             kernels.last,
             kernels.values,
-            kernels.coarse.shape[0],
+            n_coarse,
         )
-        flux, diagonal, restricted = _march(
+        return _march(
             ops.energy,
             ops.removal,
             ops.scatter,
@@ -427,12 +460,45 @@ def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable
             coarse_source,
             anisotropy == "separable",
             ops.moment_weights,
+            start,
         )
+
+    block = upscatter_block(kernels) if kernels.values.shape[0] > 0 else None
+    applications = 0
+    for count in range(1, MAX_SWEEPS + 1):
+        flux, diagonal, restricted = sweep(source, lagged, 0)
         scale = np.abs(restricted).max()
         if (
             kernels.values.shape[0] == 0
             or np.abs(restricted - lagged).max() <= SWEEP_TOLERANCE * scale
         ):
-            return EnergySolution(flux, diagonal, sweep)
-        lagged = restricted
+            return EnergySolution(flux, diagonal, count, applications)
+        if block is None:
+            lagged = restricted
+            continue
+        first_hat, start = block
+        zero = np.zeros(n)
+        shape = (n_terms, n_coarse - first_hat)
+
+        def apply(v, first_hat=first_hat, start=start, zero=zero, shape=shape):
+            x = np.zeros((n_terms, n_coarse))
+            x[:, first_hat:] = v.reshape(shape)
+            out = sweep(zero, x, start)[2]
+            return v - out[:, first_hat:].ravel()
+
+        # The sweep gave r = G x + b; the block's own problem is (I - G_bb) dx = r_b - x_b.
+        rhs = (restricted[:, first_hat:] - lagged[:, first_hat:]).ravel()
+        # The outer test is SWEEP_TOLERANCE * scale on each entry. A 2-norm bound bounds every
+        # entry, so a tenth of it leaves the outer test to the other hats; a bound scaled by
+        # sqrt(entries) would not, and the outer sweeps would never pass.
+        # A relative stop as well keeps GMRES off its round-off floor; what it leaves is a smaller
+        # right-hand side for the next sweep's block solve.
+        tolerance = 0.1 * SWEEP_TOLERANCE * scale
+        change, used = solve(
+            apply, rhs, atol=tolerance, rtol=BLOCK_RTOL, max_iterations=BLOCK_RESTARTS
+        )
+        applications += used
+        updated = restricted.copy()
+        updated[:, first_hat:] = lagged[:, first_hat:] + change.reshape(shape)
+        lagged = updated
     raise RuntimeError(f"inelastic sweeps did not converge in {MAX_SWEEPS}")
