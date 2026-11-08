@@ -465,3 +465,40 @@ def test_node_pairs_straddle_each_jump():
     assert pairs.shape == (2,)
     assert pairs[0] == 100.0
     assert 0.0 < 100.0 - pairs[1] < 1e-7
+
+
+@needs_library
+@pytest.mark.parametrize("curves", ["all", "major", "macroscopic"])
+def test_thinned_grids_hold_their_curves_at_every_library_point(curves):
+    from zerog.data.grid import major_curves
+    from zerog.data.neutron import read_reactions
+    from zerog.energy.terms import thinned_grids
+
+    nuclides = [("Fe56", "294K"), ("Na23", "294K")]
+    densities = np.array([0.02, 0.01])
+    rtol, atol = 1e-3, 1e-8
+    grid = np.unique(np.concatenate(thinned_grids(nuclides, rtol, atol, 2e7, curves, densities)))
+    grid = grid[::-1]
+    data = [read_reactions(*key) for key in nuclides]
+
+    def check(energy, values):
+        keep = energy <= grid[0]
+        energy, values = energy[keep], values[keep]
+        approx = interpolate(energy, grid, interpolate(grid, energy, values))
+        assert np.all(np.abs(approx - values) <= rtol * np.abs(values) + atol * (1 + 1e-9))
+
+    if curves == "macroscopic":
+        energy = np.unique(np.concatenate([d.energy for d in data]))[::-1]
+        energy = energy[energy <= grid[0]]
+        total = sum(
+            n * interpolate(energy, d.energy, major_curves(d)[0])
+            for d, n in zip(data, densities, strict=True)
+        )
+        check(energy, total)
+        with pytest.raises(ValueError, match="density"):
+            thinned_grids(nuclides, rtol, atol, 2e7, curves)
+    else:
+        for d in data:
+            tested = d.xs if curves == "all" else major_curves(d)
+            for row in tested:
+                check(d.energy, row)

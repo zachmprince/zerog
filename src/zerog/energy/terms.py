@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from zerog.data.grid import thin_reactions
+from zerog.data.grid import major_curves, thin_indices, thin_reactions
 from zerog.data.neutron import MT_CAPTURE, MT_ELASTIC, read_reactions
 from zerog.data.scatter import read_scattering_laws
 from zerog.energy.elastic import refine_for_angle
@@ -63,6 +63,8 @@ def transport_grid(
     coarse_du=COARSE_DU,
     required=(),
     thermal=None,
+    curves="all",
+    densities=None,
 ):
     """A fine grid as elastic_grid, holding a coarse grid for inelastic transfer. Returns both.
 
@@ -70,7 +72,9 @@ def transport_grid(
     (reach, kT, awr) from thermal_grid_settings, widens coarse hats below reach as
     zerog.energy.thermal.thermal_coarse does.
     """
-    fine = elastic_grid(nuclides, rtol, atol, energy_max, energy_min, subdivide, required)
+    fine = elastic_grid(
+        nuclides, rtol, atol, energy_max, energy_min, subdivide, required, curves, densities
+    )
     coarse = coarse_grid(fine, coarse_du, _thresholds(nuclides, energy_max, energy_min))
     if thermal is not None:
         thresholds = _thresholds(nuclides, energy_max, energy_min)
@@ -87,15 +91,72 @@ def _thresholds(nuclides, energy_max, energy_min):
     return np.array(out)
 
 
-def elastic_grid(nuclides, rtol, atol, energy_max, energy_min, subdivide=1, required=()):
+GRID_CURVES = ("all", "major", "macroscopic")
+
+
+def thinned_grids(nuclides, rtol, atol, energy_max, curves="all", densities=None):
+    """Thinned grids to merge, by which curves they hold within rtol * |curve| + atol:
+
+    - "all": every non-redundant reaction of each nuclide, valid for any non-negative densities.
+    - "major": each nuclide's total, elastic, capture and fission (zerog.data.grid.major_curves).
+    - "macroscopic": the mix's total, elastic, capture and fission, summed with densities
+      (atoms/b-cm, one per nuclide), on the union of the nuclides' own points. Valid for that
+      composition only, and atol is then in 1/cm.
+
+    Thresholds are kept in every case, so reactions stay zero below them.
+    """
+    data = [read_reactions(*key) for key in nuclides]
+    if curves == "all":
+        return [thin_reactions(d, rtol, atol, energy_max) for d in data]
+    if curves == "major":
+        return [_thin_major(d, rtol, atol, energy_max) for d in data]
+    if curves != "macroscopic":
+        raise ValueError(f"curves must be one of {GRID_CURVES}, not {curves!r}")
+    if densities is None or len(densities) != len(data):
+        raise ValueError("a macroscopic grid needs one density per nuclide")
+    energy = np.unique(np.concatenate([d.energy for d in data]))[::-1]
+    energy = energy[energy <= energy_max]
+    total = np.zeros((4, energy.shape[0]))
+    for d, n in zip(data, densities, strict=True):
+        major = major_curves(d)
+        for c in range(4):
+            total[c] += n * interpolate(energy, d.energy, major[c])
+    required = np.zeros(energy.shape[0], dtype=np.bool_)
+    thresholds = np.concatenate([d.threshold for d in data])
+    thresholds = thresholds[thresholds <= energy_max]
+    required[np.clip(np.searchsorted(-energy, -thresholds), 0, energy.shape[0] - 1)] = True
+    return [energy[thin_indices(energy, total, required, rtol, atol)]]
+
+
+def _thin_major(data, rtol, atol, energy_max):
+    start = np.searchsorted(-data.energy, -energy_max)
+    energy = data.energy[start:]
+    required = np.zeros(energy.shape[0], dtype=np.bool_)
+    thresholds = data.threshold[data.threshold <= energy_max]
+    required[np.searchsorted(-energy, -thresholds)] = True
+    major = major_curves(data)[:, start:]
+    return energy[thin_indices(energy, np.ascontiguousarray(major), required, rtol, atol)]
+
+
+def elastic_grid(
+    nuclides,
+    rtol,
+    atol,
+    energy_max,
+    energy_min,
+    subdivide=1,
+    required=(),
+    curves="all",
+    densities=None,
+):
     """A grid for elastic scattering between two energies, for (name, label) pairs.
 
     It holds node pairs at each term's first window edge below energy_max, where a point source
     there jumps, and resolves forward peaks. subdivide then splits every panel, including those
-    capped by a peak, since the thinned grid resolves cross sections and not F.
+    capped by a peak, since the thinned grid resolves cross sections and not F. curves and
+    densities choose the thinned grids, as thinned_grids describes.
     """
-    data = {key: read_reactions(*key) for key in nuclides}
-    grids = [thin_reactions(curves, rtol, atol, energy_max) for curves in data.values()]
+    grids = thinned_grids(nuclides, rtol, atol, energy_max, curves, densities)
     alpha = [kinematic_alpha(_awr(name)) for name, _ in nuclides]
     angle = [_elastic_angle(name) for name, _ in nuclides]
     jumps = node_pairs([a * energy_max for a in alpha if a * energy_max > energy_min])
