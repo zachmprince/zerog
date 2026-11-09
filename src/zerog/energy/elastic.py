@@ -746,3 +746,52 @@ def separable_correction(
         upper_e = lower_e
         j += 1
     return known, own
+
+
+def thin_angle(angle, tolerance):
+    """AngleTables with each table's cosines thinned so lin-lin interpolation stays within
+    tolerance of the pdf, an absolute bound (a pdf integrates to one over a width of two, so its
+    area moves by at most twice that), and the pdf renormalized to one (cdf recomputed). A bound
+    relative to the peak instead lets a forward peak of 67 (U238 at 30 MeV) shift the area, and so
+    the whole table, by 5%.
+
+    The march's anisotropic correction costs about one segment per cosine piece in each node's
+    window, so this is its main cost lever; None or a non-positive tolerance returns angle.
+    """
+    if angle is None or tolerance is None or tolerance <= 0.0:
+        return angle
+    from zerog.data.grid import thin_indices
+    from zerog.data.scatter import AngleTables
+
+    offsets = [0]
+    mus, pdfs, cdfs = [], [], []
+    for i in range(angle.energy.shape[0]):
+        mu = angle.mu[angle.offsets[i] : angle.offsets[i + 1]]
+        pdf = angle.pdf[angle.offsets[i] : angle.offsets[i + 1]]
+        if angle.interpolation[i] == RULE_LIN_LIN and mu.shape[0] > 2:
+            keep = thin_indices(
+                mu,
+                pdf[None, :].copy(),
+                np.zeros(mu.shape[0], dtype=np.bool_),
+                0.0,
+                tolerance,
+            )
+            mu, pdf = mu[keep], pdf[keep]
+        if angle.interpolation[i] == RULE_LIN_LIN:
+            area = np.concatenate([[0.0], np.cumsum(0.5 * (pdf[1:] + pdf[:-1]) * np.diff(mu))])
+            pdf = pdf / area[-1]
+            cdf = area / area[-1]
+        else:
+            cdf = angle.cdf[angle.offsets[i] : angle.offsets[i + 1]]
+        mus.append(mu)
+        pdfs.append(pdf)
+        cdfs.append(cdf)
+        offsets.append(offsets[-1] + mu.shape[0])
+    return AngleTables(
+        energy=angle.energy,
+        offsets=np.array(offsets, dtype=np.int64),
+        interpolation=angle.interpolation,
+        mu=np.concatenate(mus),
+        pdf=np.concatenate(pdfs),
+        cdf=np.concatenate(cdfs),
+    )

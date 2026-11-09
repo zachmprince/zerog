@@ -16,6 +16,7 @@ from zerog.energy.balance import energy_balance
 from zerog.energy.eigen import solve_k
 from zerog.energy.fission import fission_source
 from zerog.energy.mix import build_mix
+from zerog.energy.subproblem import solve_energy
 
 TWIN = Path(__file__).parents[3] / "benchmarks" / "05-fast-k-infinity"
 # Kernels are rebuilt each run (minutes), not cached: caches ran to tens of GB per study.
@@ -56,6 +57,11 @@ def solve_case(
     solved = time.perf_counter() - start
     fission = solution.fission if solution.fission is not None else mix.fission
     source = fission_source(mix.ops, fission, d, solution.flux) / solution.k
+    # The speed gate's measure: one cold fixed-source solve from the converged fission source.
+    start = time.perf_counter()
+    fixed = solve_energy(mix.ops, d, d[:, None], 0.0, source)
+    mix.timings["fixed_source"] = time.perf_counter() - start
+    mix.timings["fixed_source_sweeps"] = fixed.sweeps
     balance = energy_balance(mix.ops, d, d[:, None], 0.0, source, solution.flux, solution.shield)
     comparison = compare(mix, solution.k, solution.flux, summary, solution.shield, fission)
     return mix, solution, comparison, balance.residual / balance.source, built, solved
@@ -69,6 +75,10 @@ def run(name, rtol=1e-3, subdivide=1, light=None, curves="all"):
         f"{name}: {mix.energy.shape[0]} nodes, build {built:.0f} s, solve {solved:.0f} s, "
         f"{solution.iterations} iterations, {solution.sweeps} sweeps, "
         f"{solution.block_marches} block marches, residual/source {closure:.2e}"
+    )
+    print(
+        f"  fixed-source solve {mix.timings['fixed_source']:.1f} s, "
+        f"{mix.timings['fixed_source_sweeps']} sweeps"
     )
     print(comparison.report().split("\n")[0])
     print("  k history " + " ".join(f"{k:.7f}" for k in solution.history))

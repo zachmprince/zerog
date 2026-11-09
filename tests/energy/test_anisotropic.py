@@ -475,3 +475,24 @@ def test_tables_and_moments_match_openmc_data(name):
                 for j in range(len(table.x) - 1)
             )
             assert moments[order] == pytest.approx(exact, abs=1e-9)
+
+
+@needs_library
+@pytest.mark.parametrize("name", ["U238", "O16", "Fe56"])
+def test_thinned_angle_tables_stay_within_tolerance_and_normalized(name):
+    from zerog.energy.elastic import thin_angle
+    from zerog.energy.terms import _elastic_angle
+
+    angle = _elastic_angle(name)
+    tolerance = 1e-3  # absolute, in pdf units
+    thin = thin_angle(angle, tolerance)
+    assert thin.mu.shape[0] < angle.mu.shape[0]
+    for i in range(angle.energy.shape[0]):
+        mu = angle.mu[angle.offsets[i] : angle.offsets[i + 1]]
+        pdf = angle.pdf[angle.offsets[i] : angle.offsets[i + 1]]
+        t_mu = thin.mu[thin.offsets[i] : thin.offsets[i + 1]]
+        t_pdf = thin.pdf[thin.offsets[i] : thin.offsets[i + 1]]
+        assert np.trapezoid(t_pdf, t_mu) == pytest.approx(1.0, abs=1e-12)
+        # Within the tolerance, plus what renormalizing moved: at most twice it, times the pdf.
+        back = np.interp(mu, t_mu, t_pdf)
+        assert np.abs(back - pdf).max() <= tolerance + 2.5 * tolerance * pdf.max() + 1e-9

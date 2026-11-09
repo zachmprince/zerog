@@ -412,3 +412,28 @@ def test_bound_hydrogen_block_conserves_neutrons():
     solution = solve_energy(ops, [1.0], [[1.0]], 0.05, source)
     balance = energy_balance(ops, [1.0], [[1.0]], 0.05, source, solution.flux)
     assert abs(balance.residual / balance.source) < 1e-3
+
+
+def test_round_off_upward_deposits_do_not_start_the_block():
+    """An inelastic row's round-off above its neighbour is lagged by the sweeps, not solved by
+    Krylov: only a real share of a row going up starts the block."""
+
+    energy = np.geomspace(1e6, 1e3, 200)
+    coarse = coarse_grid(energy, 0.01)
+    energy = np.unique(np.concatenate([energy, coarse]))[::-1]
+    base = build_inelastic([None], energy, coarse)
+    n = coarse.shape[0]
+    j = n // 2
+    # One row with 1e-12 of itself two hats up, then the same row with a tenth.
+    for share, expect in ((1e-12, False), (0.1, True)):
+        values = np.array([share, 0.0, 1.0 - share])
+        kernels = InelasticKernels(
+            **{
+                **base.__dict__,
+                "starts": np.zeros((1, n), dtype=np.int64),
+                "first": np.where(np.arange(n) == j, j - 2, 0)[None, :],
+                "last": np.where(np.arange(n) == j, j + 1, 0)[None, :],
+                "values": values,
+            }
+        )
+        assert (upscatter_block(kernels) is not None) == expect

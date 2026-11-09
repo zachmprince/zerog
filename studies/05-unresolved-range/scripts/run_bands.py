@@ -34,6 +34,8 @@ def main():
         "nodes": int(mix.energy.shape[0]),
         "build_s": built,
         "solve_s": solved,
+        "fixed_source_s": mix.timings.get("fixed_source"),
+        "fixed_source_sweeps": mix.timings.get("fixed_source_sweeps"),
         "sweeps": solution.sweeps,
         "residual": closure,
         "k": solution.k,

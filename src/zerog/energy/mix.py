@@ -5,11 +5,12 @@ kernels, and the operators, from a composition. Densities here are the physical 
 subproblem takes effective densities per term separately.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
 from zerog.data.neutron import MT_FISSION, MT_PARTIAL_FISSION, read_reactions
+from zerog.energy.elastic import thin_angle
 from zerog.energy.fission import build_fission, data_top, fission_nodes
 from zerog.energy.grid import interpolate
 from zerog.energy.inelastic import build_inelastic
@@ -28,6 +29,10 @@ from zerog.energy.urr import build_urr, urr_required
 
 LIBRARY_BOTTOM = 1.0e-5  # eV, the bottom of ENDF/B-VIII.0's neutron grids
 ORDER_WORKERS = 4
+# Off by default: thinning angle tables to 1e-3 (absolute, in pdf units) saved nothing on study
+# 03's SFR mix, and 3e-3 saved a fifth of a sweep for 1e-3 of the flux (M9). The anisotropic
+# correction's cost is per node, not per cosine piece.
+ANGLE_TOLERANCE = 0.0
 
 
 @dataclass(frozen=True)
@@ -45,6 +50,7 @@ class Mix:
     thermal: list  # ThermalTerm or None per nuclide
     ops: object
     fission: object
+    timings: dict = field(default_factory=dict)  # seconds, filled by callers that time solves
 
     def fission_xs(self, i):
         """Nuclide i's fission cross section on the grid, partial reactions included."""
@@ -67,6 +73,7 @@ def build_mix(
     atol=1e-8,
     bands=0,
     orders=0,
+    angle_tolerance=ANGLE_TOLERANCE,
 ):
     """Assemble a mix of {name: atoms/b-cm} at a library temperature label.
 
@@ -77,6 +84,8 @@ def build_mix(
     directory for inelastic and thermal kernels. bands, a power of two, turns probability tables on
     with that many band combinations (zerog.energy.urr); 0 leaves them off. orders adds elastic
     Legendre orders 1 .. orders (zerog.energy.moments), built one process per nuclide.
+    angle_tolerance thins each elastic angle table's cosines (zerog.energy.elastic.thin_angle),
+    the anisotropic correction's main cost; 0 keeps the library's tables.
     """
     names = list(densities)
     density = np.array([densities[n] for n in names], dtype=float)
@@ -111,6 +120,7 @@ def build_mix(
     terms = [
         t if s is None else apply_thermal(t, s, energy) for t, s in zip(terms, specs, strict=True)
     ]
+    terms = [replace(t, angle=thin_angle(t.angle, angle_tolerance)) for t in terms]
     # Order rows first, while the process is small: forked workers copy what they touch.
     order_rows = _order_rows(names, terms, energy, coarse, orders) if orders else None
     kernels = build_inelastic([(n, label, awr(n)) for n in names], energy, coarse, cache=cache)

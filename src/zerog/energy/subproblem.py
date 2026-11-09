@@ -35,6 +35,7 @@ MAX_SWEEPS = 50
 SWEEP_TOLERANCE = 1e-12  # on the hats' emission, relative to the largest
 BLOCK_RESTARTS = 20  # GMRES restart cycles per block solve
 BLOCK_RTOL = 1e-10  # GMRES stop relative to the block's right-hand side
+UPSCATTER_SHARE = 1e-6  # share of a hat's row above its upper neighbour that calls for the block
 
 
 @dataclass(frozen=True)
@@ -659,12 +660,21 @@ def _lagged_source(d_scatter, lagged, starts, first, last, values, n_coarse):
 def upscatter_block(kernels):
     """The first coarse hat of the block solved by Krylov, and the fine node its rows reach up to.
 
-    The block starts at the highest hat whose row reaches above its upper neighbour, which only
-    thermal scattering does, and runs to the bottom. None if no row reaches up.
+    The block starts at the highest hat whose row puts more than UPSCATTER_SHARE of itself above
+    its upper neighbour, which only thermal scattering does, and runs to the bottom. None if no
+    row reaches up.
     """
     n = kernels.coarse.shape[0]
     filled = kernels.last > kernels.first
     upward = filled & (kernels.first < np.arange(n)[None, :] - 1)
+    # Inelastic rows can leave round-off above their neighbour (1e-11 of a row, in Pu239's), which
+    # lagged sweeps handle; only a real share of a row going up needs the block.
+    for t, j in zip(*np.nonzero(upward), strict=True):
+        a = kernels.starts[t, j]
+        row = kernels.values[a : a + kernels.last[t, j] - kernels.first[t, j]]
+        above = np.abs(row[: j - 1 - kernels.first[t, j]]).sum()
+        if above <= UPSCATTER_SHARE * np.abs(row).sum():
+            upward[t, j] = False
     if not upward.any():
         return None
     first_hat = int(np.nonzero(upward.any(axis=0))[0].min())

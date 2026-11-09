@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ZeroG is a research code for a deterministic full-core neutron transport solver with **no multigroup library**. The angular flux is a PGD (proper generalized decomposition) expansion ψ(x,Ω,E) ≈ Σₘ Xₘ(x,Ω) εₘ(E), with the energy modes εₘ on a pointwise grid built directly from evaluated nuclear data. It starts with PWR benchmarks but must assume nothing LWR-specific (SFR cases are an early second target: no thermal spectrum, square lattices or water assumptions in core code).
 
-Phase 0 is closed (`docs/decisions/004-phase-0-close.md` lists the limits Phase 1 inherits): `src/zerog/data/` holds the nuclear data readers and union grid, and the other subpackages are still empty. The development plan lives in `Pointwise-Energy PGD Transport Development Plan.md` in the repo root. It is deliberately **untracked and not in `.gitignore`**; never `git add -A` blindly, and never commit it.
+Phase 0 and Phase 1 are closed. `src/zerog/data/` holds the nuclear data readers and union grid, and `src/zerog/energy/` the 0D energy subproblem (`subproblem.solve_energy`): elastic, inelastic, thermal (free gas, S(α,β)), fission, probability-table bands and Legendre orders, with `mix.build_mix` and `eigen.solve_k` around it. `docs/decisions/012-phase-1-close.md` lists the gate results and the limits Phase 2 inherits, including the unmet speed target. `space/`, `pgd/` and `mesh/` are still empty. The development plan lives in `Pointwise-Energy PGD Transport Development Plan.md` in the repo root. It is deliberately **untracked and not in `.gitignore`**; never `git add -A` blindly, and never commit it.
 
 ## Commands
 
@@ -27,7 +27,7 @@ Nuclear data comes from the `OPENMC_CROSS_SECTIONS` env var (ENDF/B-VIII.0 HDF5 
 One package, `zerog`, with a module per PGD subproblem:
 
 - `data/`: OpenMC HDF5 reader, union energy grid, temperature interpolation, S(α,β), unresolved-range probability tables
-- `energy/`: 0D slowing-down/thermalization solve (the PGD energy subproblem), kernel Legendre moments
+- `energy/`: 0D slowing-down/thermalization solve (the PGD energy subproblem), kernel Legendre moments (built in Phase 1)
 - `space/`: 1D reference transport, DG-FEM S_N (the PGD spatial subproblem, one-group)
 - `pgd/`: driver, subproblem coupling, update step, eigenvalue iteration
 - `mesh/`: Gmsh/meshio input, composition and temperature fields per element
@@ -48,5 +48,5 @@ Key design constraints that span modules:
 - **Kernels:** flat NumPy arrays and Numba-compilable functions with no Python objects inside (GPU port should be mechanical). Keep layouts array-based and batched.
 - **Tests:** every physics kernel needs an analytic check or a comparison against `openmc.data` before use in a study.
 - **Validation:** each study gets an OpenMC twin with the same geometry, data and settings. Turn OpenMC's unresolved-range probability tables off until we implement ours.
-- **Data and results:** never commit nuclear data; results larger than a few MB stay out of git.
+- **Data and results:** never commit nuclear data; results larger than a few MB stay out of git. Disk is tight: kernel caches are opt-in (`ZEROG_KERNEL_CACHE`), and study outputs and caches should be cleaned up when a study is done.
 - Ruff line length is 100.
