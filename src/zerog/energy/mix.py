@@ -27,6 +27,7 @@ from zerog.energy.thermal import build_thermal
 from zerog.energy.urr import build_urr, urr_required
 
 LIBRARY_BOTTOM = 1.0e-5  # eV, the bottom of ENDF/B-VIII.0's neutron grids
+ORDER_WORKERS = 4
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,7 @@ def build_mix(
     cache=None,
     atol=1e-8,
     bands=0,
+    orders=0,
 ):
     """Assemble a mix of {name: atoms/b-cm} at a library temperature label.
 
@@ -73,7 +75,8 @@ def build_mix(
     sets the top, in kT, for targets of awr <= 1 (terms.thermal_spec). rtol, subdivide and curves
     choose the grid (terms.transport_grid), and required energies are added to it. cache is a
     directory for inelastic and thermal kernels. bands, a power of two, turns probability tables on
-    with that many band combinations (zerog.energy.urr); 0 leaves them off.
+    with that many band combinations (zerog.energy.urr); 0 leaves them off. orders adds elastic
+    Legendre orders 1 .. orders (zerog.energy.moments), built one process per nuclide.
     """
     names = list(densities)
     density = np.array([densities[n] for n in names], dtype=float)
@@ -108,6 +111,8 @@ def build_mix(
     terms = [
         t if s is None else apply_thermal(t, s, energy) for t, s in zip(terms, specs, strict=True)
     ]
+    # Order rows first, while the process is small: forked workers copy what they touch.
+    order_rows = _order_rows(names, terms, energy, coarse, orders) if orders else None
     kernels = build_inelastic([(n, label, awr(n)) for n in names], energy, coarse, cache=cache)
     if thermal:
         kernels = build_thermal(specs, energy, kernels, cache=cache)
@@ -120,5 +125,30 @@ def build_mix(
         [t.angle for t in terms],
         kernels,
         build_urr(nuclides, energy, bands) if bands else None,
+        order_rows,
     )
     return Mix(names, label, density, energy, coarse, top, energy_min, terms, specs, ops, fission)
+
+
+def _one_term_rows(term, a, energy, coarse, orders):
+    from zerog.energy.moments import elastic_order_rows
+
+    return elastic_order_rows(term.angle, a, energy, term.elastic, coarse, orders)
+
+
+def _order_rows(names, terms, energy, coarse, orders):
+    """Each term's elastic rows for orders 1 .. orders, a process per term where fork exists."""
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    work = [(t, awr(n), energy, coarse, orders) for n, t in zip(names, terms, strict=True)]
+    # Compile the kernels here first, on a three-node coarse grid, so workers don't all compile.
+    small = np.array([coarse[0], coarse[0] * 0.5, coarse[0] * 0.25])
+    _one_term_rows(terms[0], awr(names[0]), energy, small, orders)
+    if "fork" not in multiprocessing.get_all_start_methods():
+        return [_one_term_rows(*w) for w in work]
+    context = multiprocessing.get_context("fork")
+    # Forked workers grow as they touch the parent's pages: twelve forked after the kernels were
+    # built ran a 31 GB machine out of memory.
+    with ProcessPoolExecutor(min(len(work), ORDER_WORKERS), mp_context=context) as pool:
+        return list(pool.map(_one_term_rows, *zip(*work, strict=True)))

@@ -3,6 +3,7 @@ twin. light sets the free gas threshold, in kT, for targets of awr <= 1, which O
 gas at every energy; zerog.energy.thermal.LIGHT_FREE_GAS_THRESHOLD by default."""
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,7 +18,9 @@ from zerog.energy.fission import fission_source
 from zerog.energy.mix import build_mix
 
 TWIN = Path(__file__).parents[3] / "benchmarks" / "05-fast-k-infinity"
-CACHE = Path(__file__).parent / "results" / "kernels"
+# Kernels are rebuilt each run (minutes), not cached: caches ran to tens of GB per study.
+# Set ZEROG_KERNEL_CACHE to a directory to keep them.
+CACHE = os.environ.get("ZEROG_KERNEL_CACHE")
 
 
 def solve_case(

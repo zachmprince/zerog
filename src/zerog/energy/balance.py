@@ -104,12 +104,35 @@ def _lost_below_anisotropic(
     return total
 
 
-def energy_balance(ops, removal, scatter, streaming, source, flux, shield=None):
+def energy_balance(ops, removal, scatter, streaming, source, flux, shield=None, physical=None):
     """Balance of a solve_energy result; arguments as there. shield is the solution's, for a
     problem with probability tables: removal and elastic emission then take the bands' shielded
-    cross sections where the tables apply."""
+    cross sections where the tables apply.
+
+    With orders above zero the balance is of the projected equation, over ops.extended: an order's
+    pseudo-term emits restricted @ (row sums + lost), its rows summing to <P_l> rather than one,
+    and its lost is a P_l weight leaving the grid, not neutrons. physical is the number of real
+    terms, set internally."""
     removal = np.asarray(removal, dtype=float)
     scatter = np.asarray(scatter, dtype=float)
+    n_terms = ops.removal.shape[0]
+    if scatter.ndim == 2 and scatter.shape[1] > 1 and scatter.shape[0] == n_terms:
+        orders = scatter.shape[1] - 1
+        if ops.extended is None or orders > ops.orders:
+            raise ValueError(f"scatter has {orders} orders above zero, ops holds {ops.orders}")
+        padded = np.zeros((n_terms, ops.orders + 1))
+        padded[:, : orders + 1] = scatter
+        return energy_balance(
+            ops.extended,
+            np.concatenate([removal, np.zeros(n_terms * ops.orders)]),
+            padded.T.ravel()[:, None],
+            streaming,
+            source,
+            flux,
+            shield,
+            n_terms,
+        )
+    physical = ops.removal.shape[0] if physical is None else physical
     total_xs = ops.removal
     elastic_xs = ops.scatter
     if shield is None and ops.urr.terms.shape[0]:
@@ -158,6 +181,19 @@ def energy_balance(ops, removal, scatter, streaming, source, flux, shield=None):
     if kernels.values.shape[0] > 0:
         restricted = restrict(kernels, ops.energy, flux, ops.rate_weights)
         for t in range(ops.removal.shape[0]):
-            emitted += scatter[t, 0] * restricted[t].sum()
+            if t < physical:
+                emitted += scatter[t, 0] * restricted[t].sum()
+            else:
+                rows = _row_sums(kernels, t) + kernels.lost[t]
+                emitted += scatter[t, 0] * float(restricted[t] @ rows)
             lost += scatter[t, 0] * float(restricted[t] @ kernels.lost[t])
     return Balance(src, emitted, removed, lost, src + emitted - removed - lost)
+
+
+def _row_sums(kernels, t):
+    """Each hat's row sum for term t."""
+    out = np.zeros(kernels.first.shape[1])
+    for j in range(out.shape[0]):
+        a, b = kernels.first[t, j], kernels.last[t, j]
+        out[j] = kernels.values[kernels.starts[t, j] : kernels.starts[t, j] + b - a].sum()
+    return out

@@ -11,6 +11,7 @@ flux integral; summarize compares them with the reference grid's (all reactions,
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -26,7 +27,9 @@ from zerog.energy.mix import build_mix  # noqa: E402
 from zerog.energy.subproblem import solve_energy  # noqa: E402
 
 RESULTS = HERE / "results"
-CACHE = HERE / "results" / "kernels"
+# Kernels are rebuilt each run (minutes), not cached: caches ran to tens of GB per study.
+# Set ZEROG_KERNEL_CACHE to a directory to keep them.
+CACHE = os.environ.get("ZEROG_KERNEL_CACHE")
 CASE = "sfr"
 # A PGD correction mode: fuel and sodium add, oxygen and two steel isotopes subtract.
 SIGNS = {"O16": -0.6, "Fe56": -0.8, "Ni58": -1.0, "Cr52": 0.5}

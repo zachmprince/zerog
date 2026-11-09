@@ -3,10 +3,12 @@
     [a + sum_t d_R[t] sigma_R[t](E)] F(u) = sum_t,l d_S[t, l] Y[t, l](E) + q(u)
 
 Y[t, l] is the emission density per unit lethargy of term t and Legendre order l, so q is a source
-per unit lethargy as well. Densities and the streaming coefficient a can be negative. The equation
-is collocated at the nodes, and the implicit part of each node's own panel moves to the left.
+per unit lethargy as well. Y[t, l] carries sigma_s times the kernel's P_l(mu_lab) moment, with no
+(2l + 1) / 2: a projection's (2l + 1) / 2 belongs in d_S[t, l], as study 06 builds it.
+Densities and the streaming coefficient a can be negative. The equation is collocated at the
+nodes, and the implicit part of each node's own panel moves to the left.
 
-Only order 0 scattering exists so far.
+Orders above zero enter as pseudo-terms with transfer rows (build_operators, order_rows).
 """
 
 from dataclasses import dataclass
@@ -53,6 +55,9 @@ class EnergyOperators:
     node_m: np.ndarray
     node_theta: np.ndarray
     urr: UrrData
+    # Orders above zero, as pseudo-terms of a second set of operators (build_operators).
+    orders: int = 0
+    extended: "EnergyOperators | None" = None
 
 
 @dataclass(frozen=True)
@@ -72,7 +77,9 @@ class EnergySolution:
     shield: np.ndarray | None = None
 
 
-def build_operators(energy, removal, scatter, alpha, angle=None, inelastic=None, urr=None):
+def build_operators(
+    energy, removal, scatter, alpha, angle=None, inelastic=None, urr=None, order_rows=None
+):
     """Check a grid against its terms, and collect the panel weights.
 
     angle is a list of AngleTables per term, with None for an isotropic one. None means all are.
@@ -81,6 +88,12 @@ def build_operators(energy, removal, scatter, alpha, angle=None, inelastic=None,
     urr is UrrData from zerog.energy.urr.build_urr, or None for no probability tables. Where a
     banded term's tables apply, its inelastic emission is only the flagged reaction's, as OpenMC's
     total there holds no other.
+
+    order_rows, for Legendre orders above zero, holds per term a list over l = 1 .. L of
+    (SparseRows, lost) on the inelastic kernels' coarse grid, as zerog.energy.moments.
+    elastic_order_rows gives them. Each (term, order) becomes a pseudo-term of extended operators,
+    with no removal and no window kernel, emitting through its rows what the term's elastic
+    cross section restricts to each hat; order 0 keeps the window recursion.
     """
     energy = np.asarray(energy, dtype=float)
     if np.any(np.diff(energy) >= 0.0):
@@ -127,6 +140,15 @@ def build_operators(energy, removal, scatter, alpha, angle=None, inelastic=None,
             inside = (energy > low) & (energy < high)
             emission[t, inside] = bands.smooth[j, 3, inside]
         kernels = InelasticKernels(**{**kernels.__dict__, "emission": emission})
+    extended = None
+    n_orders = 0
+    if order_rows is not None:
+        n_orders = len(order_rows[0])
+        if len(order_rows) != alpha.shape[0] or any(len(r) != n_orders for r in order_rows):
+            raise ValueError("order_rows must hold the same orders for every term")
+        extended = _extended_operators(
+            energy, removal, scatter, alpha, angle, kernels, bands, order_rows
+        )
     panel_m, panel_share, node_m, node_theta = panel_hats(energy, kernels.coarse)
     rates = rate_weights(energy)
     emissions = emission_weights(energy)
@@ -145,6 +167,56 @@ def build_operators(energy, removal, scatter, alpha, angle=None, inelastic=None,
         node_m=node_m,
         node_theta=node_theta,
         urr=bands,
+        orders=n_orders,
+        extended=extended,
+    )
+
+
+def _extended_operators(energy, removal, scatter, alpha, angle, kernels, bands, order_rows):
+    """Operators over the terms and then each (order, term) pseudo-term, order by order."""
+    n_terms, n = removal.shape
+    n_orders = len(order_rows[0])
+    n_coarse = kernels.coarse.shape[0]
+    zeros = np.zeros((n_terms * n_orders, n))
+    emission = np.vstack([kernels.emission, *([scatter] * n_orders)])
+    # The terms' rows keep their offsets into the flat values; order rows follow them.
+    starts = list(kernels.starts)
+    firsts = list(kernels.first)
+    lasts = list(kernels.last)
+    losts = list(kernels.lost)
+    values = [kernels.values]
+    offset = kernels.values.shape[0]
+    for order in range(n_orders):
+        for t in range(n_terms):
+            rows, lost = order_rows[t][order]
+            if rows.starts.shape[0] != n_coarse:
+                raise ValueError("order rows were built on another coarse grid")
+            starts.append(rows.starts + offset)
+            values.append(rows.values)
+            offset += rows.values.shape[0]
+            firsts.append(rows.first)
+            lasts.append(rows.last)
+            losts.append(lost)
+    merged = InelasticKernels(
+        coarse=kernels.coarse,
+        coarse_index=kernels.coarse_index,
+        hat=kernels.hat,
+        emission=emission,
+        starts=np.array(starts, dtype=np.int64),
+        first=np.array(firsts, dtype=np.int64),
+        last=np.array(lasts, dtype=np.int64),
+        values=np.concatenate(values) if values else np.empty(0),
+        lost=np.array(losts),
+    )
+    angles = [None] * n_terms if angle is None else list(angle)
+    return build_operators(
+        energy,
+        np.vstack([removal, zeros]),
+        np.vstack([scatter, zeros]),
+        np.concatenate([alpha, np.tile(alpha, n_orders)]),
+        angles + [None] * (n_terms * n_orders),
+        merged,
+        bands,
     )
 
 
@@ -690,8 +762,24 @@ def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable
     scatter = np.asarray(scatter, dtype=float)
     source = np.asarray(source, dtype=float)
     n_terms, n = ops.removal.shape
-    if scatter.ndim == 2 and scatter.shape[1] != 1 and scatter.shape[0] == n_terms:
-        raise NotImplementedError("only order 0 scattering exists so far")
+    if scatter.ndim == 2 and scatter.shape[0] == n_terms and scatter.shape[1] > 1:
+        orders = scatter.shape[1] - 1
+        if ops.extended is None or orders > ops.orders:
+            raise ValueError(f"scatter has {orders} orders above zero, ops holds {ops.orders}")
+        if removal.shape != (n_terms,) or source.shape != (n,):
+            raise ValueError(f"shape: removal {removal.shape} and source {source.shape}")
+        # Pseudo-terms, order by order, after the terms: no removal, each order's density.
+        padded = np.zeros((n_terms, ops.orders + 1))
+        padded[:, : orders + 1] = scatter
+        d_removal = np.concatenate([removal, np.zeros(n_terms * ops.orders)])
+        d_scatter = padded.T.ravel()[:, None]
+        start = None
+        if initial is not None:
+            start = np.zeros((d_removal.shape[0], ops.extended.inelastic.coarse.shape[0]))
+            start[:n_terms] = initial
+        return solve_energy(
+            ops.extended, d_removal, d_scatter, streaming, source, anisotropy, start
+        )
     if removal.shape != (n_terms,) or scatter.shape != (n_terms, 1) or source.shape != (n,):
         raise ValueError(
             f"shape: removal {removal.shape}, scatter {scatter.shape} and source {source.shape} "

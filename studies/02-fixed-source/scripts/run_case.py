@@ -1,6 +1,7 @@
 """ZeroG side of study 02. Usage: run_case.py <case> [rtol] [subdivide]. Compares with the twin."""
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -39,7 +40,8 @@ def run(name, rtol=1e-3, subdivide=1):
             [(n, TEMPERATURE, awr(n)) for n in densities],
             grid,
             coarse,
-            cache=Path(__file__).parent / "results" / "kernels",
+            # Rebuilt each run unless ZEROG_KERNEL_CACHE names a directory to keep them in.
+            cache=os.environ.get("ZEROG_KERNEL_CACHE"),
         )
         if fast
         else None
