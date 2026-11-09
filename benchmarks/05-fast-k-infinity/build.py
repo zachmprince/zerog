@@ -1,10 +1,11 @@
 """OpenMC twin of study 03: k-infinity of a homogenized reactor mix.
 
-Usage: build.py <case> <particles per batch> <active batches> [nocut]. An infinite medium (a
-reflective box) at one temperature, with probability tables off and neutrons killed below the
-case's energy_min, if it has one, as ZeroG's grid ends there. With nocut the cutoff is left at
-OpenMC's default, to measure what it costs. Results go to results/<case>/, gitignored apart from
-the small summary in <case>[-nocut].json.
+Usage: build.py <case> <particles per batch> <active batches> [nocut] [ptables]. An infinite
+medium (a reflective box) at one temperature, with probability tables off and neutrons killed below
+the case's energy_min, if it has one, as ZeroG's grid ends there. With nocut the cutoff is left at
+OpenMC's default, to measure what it costs; with ptables, unresolved-range probability tables are
+on, for study 05. Results go to results/<label>/, gitignored apart from the small summary in
+<label>.json, where label is the case with -nocut and -ptables appended as they apply.
 """
 
 import hashlib
@@ -26,7 +27,7 @@ INACTIVE = 20
 ENERGY_MAX = 2.0e7  # eV, the lowest top of the library's grids for these nuclides
 
 
-def build(name, particles, active, cut=True):
+def build(name, particles, active, cut=True, ptables=False):
     case = CASES[name]
     material = openmc.Material()
     for nuclide, density in case["densities"].items():
@@ -48,7 +49,7 @@ def build(name, particles, active, cut=True):
     settings.inactive = INACTIVE
     settings.seed = SEED
     settings.photon_transport = False
-    settings.ptables = False
+    settings.ptables = ptables
     settings.temperature = {"method": "nearest", "tolerance": 1.0}
     energy_min = case["energy_min"]
     if cut and energy_min is not None:
@@ -80,10 +81,11 @@ def build(name, particles, active, cut=True):
 def main():
     name, particles, active = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
     cut = "nocut" not in sys.argv[4:]
-    label = name if cut else f"{name}-nocut"
+    ptables = "ptables" in sys.argv[4:]
+    label = name + ("" if cut else "-nocut") + ("-ptables" if ptables else "")
     work = HERE / "results" / label
     work.mkdir(parents=True, exist_ok=True)
-    statepoint = build(name, particles, active, cut).run(cwd=work, output=False)
+    statepoint = build(name, particles, active, cut, ptables).run(cwd=work, output=False)
     with openmc.StatePoint(statepoint) as sp:
         flux = sp.get_tally(name="flux")
         rates = sp.get_tally(name="rates")
@@ -102,6 +104,7 @@ def main():
                 "batches": INACTIVE + active,
                 "inactive": INACTIVE,
                 "cutoff": CASES[name]["energy_min"] if cut else None,
+                "ptables": ptables,
                 "date": datetime.now(UTC).isoformat(timespec="seconds"),
             },
             "k": sp.keff.nominal_value,

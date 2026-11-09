@@ -26,6 +26,7 @@ from zerog.energy.elastic import (
 )
 from zerog.energy.grid import MAX_PANEL, centred_weights, emission_weights, rate_weights
 from zerog.energy.inelastic import InelasticKernels, no_inelastic, panel_hats
+from zerog.energy.urr import UrrData, band_mean, band_xs, in_range, no_urr
 from zerog.linalg import solve
 
 MAX_SWEEPS = 50
@@ -51,6 +52,7 @@ class EnergyOperators:
     panel_share: np.ndarray
     node_m: np.ndarray
     node_theta: np.ndarray
+    urr: UrrData
 
 
 @dataclass(frozen=True)
@@ -65,14 +67,20 @@ class EnergySolution:
     diagonal: np.ndarray
     sweeps: int = 1
     block_marches: int = 0  # marches of the upscatter block, inside its Krylov solves
+    # Per banded term (ops.urr.terms), its self-shielded (total, elastic, capture, fission) at every
+    # node, the smooth cross sections where no tables apply; capture is absorption less fission.
+    shield: np.ndarray | None = None
 
 
-def build_operators(energy, removal, scatter, alpha, angle=None, inelastic=None):
+def build_operators(energy, removal, scatter, alpha, angle=None, inelastic=None, urr=None):
     """Check a grid against its terms, and collect the panel weights.
 
     angle is a list of AngleTables per term, with None for an isotropic one. None means all are.
     inelastic is InelasticKernels from zerog.energy.inelastic.build_inelastic, or None for none.
     Its emission adds to scattering, so removal must hold the term's whole total cross section.
+    urr is UrrData from zerog.energy.urr.build_urr, or None for no probability tables. Where a
+    banded term's tables apply, its inelastic emission is only the flagged reaction's, as OpenMC's
+    total there holds no other.
     """
     energy = np.asarray(energy, dtype=float)
     if np.any(np.diff(energy) >= 0.0):
@@ -106,6 +114,19 @@ def build_operators(energy, removal, scatter, alpha, angle=None, inelastic=None)
         raise ValueError(
             "inelastic kernels were built on a grid that this energy grid doesn't hold"
         )
+    bands = no_urr(energy.shape[0]) if urr is None else urr
+    if bands.smooth.shape[2] != energy.shape[0]:
+        raise ValueError("probability tables were built on another grid")
+    if bands.terms.shape[0] and (bands.terms.max() >= alpha.shape[0] or bands.terms.min() < 0):
+        raise ValueError(f"banded terms {bands.terms} outside {alpha.shape[0]} terms")
+    if bands.terms.shape[0]:
+        emission = kernels.emission.copy()
+        for j, t in enumerate(bands.terms):
+            low = bands.energy[bands.start[j]]
+            high = bands.energy[bands.start[j + 1] - 1]
+            inside = (energy > low) & (energy < high)
+            emission[t, inside] = bands.smooth[j, 3, inside]
+        kernels = InelasticKernels(**{**kernels.__dict__, "emission": emission})
     panel_m, panel_share, node_m, node_theta = panel_hats(energy, kernels.coarse)
     rates = rate_weights(energy)
     emissions = emission_weights(energy)
@@ -123,6 +144,7 @@ def build_operators(energy, removal, scatter, alpha, angle=None, inelastic=None)
         panel_share=panel_share,
         node_m=node_m,
         node_theta=node_theta,
+        urr=bands,
     )
 
 
@@ -192,6 +214,19 @@ def _march(
     separable,
     moment_weights,
     start,
+    u_terms,
+    u_start,
+    u_bands,
+    u_energy,
+    u_cdf,
+    u_elastic,
+    u_fission,
+    u_capture,
+    u_multiply,
+    u_rule,
+    u_smooth,
+    u_points,
+    u_weights,
 ):
     """Forward substitution over the nodes from start, with F zero above it.
 
@@ -209,6 +244,15 @@ def _march(
     Every running sum is linear in the F above it, so with F zero above start, marching from start
     with empty sums is the whole march. The block solve uses that for sources that only reach
     below start.
+
+    Where a banded term's probability tables apply (zerog.energy.urr), the node's F splits into one
+    F_c per band combination c of weight p_c, each with its own removal, and all fed by one
+    scattering source: D_c F_c = p_c (R + sum_c' g_c' F_c'), where g_c is the own panel's
+    scattering, so F_c = p_c R / ((1 - A) D_c) with A = sum_c p_c g_c / D_c. The panel above
+    takes each band's own products, so running sums are exact. Window edges and moment trees take
+    each banded term's self-shielded cross section, sum_c sigma_c F_c / F, which shield returns
+    per banded term: (total, elastic, capture, fission) at every node. capture is absorption less
+    fission.
     """
     n_terms = removal.shape[0]
     n = energy.shape[0]
@@ -240,11 +284,122 @@ def _march(
     size = moment_tree_size(tree_panels + 1)
     widths = np.log(energy[:-1] / energy[1:])
     trees = np.zeros((n_slots, 2 * size if n_slots > 0 else 0, 4))
-    for k in range(start, n):
+    # Bands: each banded term's index, its band cross sections at this node and the one above, and
+    # every combination's F there.
+    n_banded = u_terms.shape[0]
+    n_comb = u_points.shape[0]
+    band_of = np.full(n_terms, -1)
+    for j in range(n_banded):
+        band_of[u_terms[j]] = j
+    scatter = scatter.copy()  # banded nodes take their self-shielded elastic
+    shield = np.zeros((n_banded, 4, n if n_banded > 0 else 0))
+    for j in range(n_banded):
+        t = u_terms[j]
+        shield[j, 0] = removal[t]
+        shield[j, 1] = scatter[t]
+        shield[j, 2] = u_smooth[j, 1]
+        shield[j, 3] = u_smooth[j, 2]
+    in_now = np.zeros(n_banded, dtype=np.bool_)
+    in_before = np.zeros(n_banded, dtype=np.bool_)
+    el_now = np.zeros((n_banded, n_comb))
+    el_before = np.zeros((n_banded, n_comb))
+    tot_now = np.zeros((n_banded, n_comb))
+    cap_now = np.zeros((n_banded, n_comb))
+    fis_now = np.zeros((n_banded, n_comb))
+    f_now = np.zeros(n_comb)
+    f_before = np.zeros(n_comb)
+    d_band = np.zeros(n_comb)
+    g_band = np.zeros(n_comb)
+    smooth_k = np.zeros(4)
+    # The node above start only sets the band state, which the panel down to start needs.
+    for k in range(max(start - 1, 0), n):
         lhs = streaming
         rhs = source[k]
+        # Band state at node k: which tables apply, and every combination's cross sections.
+        any_now = False
+        for j in range(n_banded):
+            in_before[j] = in_now[j]
+            for c in range(n_comb):
+                el_before[j, c] = el_now[j, c]
+            in_now[j] = in_range(u_energy, u_start, j, energy[k])
+            t = u_terms[j]
+            if in_now[j]:
+                any_now = True
+                for q in range(4):
+                    smooth_k[q] = u_smooth[j, q, k]
+                for c in range(n_comb):
+                    xs = band_xs(
+                        u_energy,
+                        u_start,
+                        u_bands,
+                        u_cdf,
+                        u_elastic,
+                        u_fission,
+                        u_capture,
+                        u_multiply,
+                        u_rule,
+                        j,
+                        energy[k],
+                        u_points[c, j],
+                        smooth_k,
+                    )
+                    el_now[j, c] = xs[0]
+                    cap_now[j, c] = xs[1]
+                    fis_now[j, c] = xs[2]
+                # Scale each reaction so the points' mean is the exact mean over r.
+                exact = band_mean(
+                    u_energy,
+                    u_start,
+                    u_bands,
+                    u_cdf,
+                    u_elastic,
+                    u_fission,
+                    u_capture,
+                    u_multiply,
+                    u_rule,
+                    j,
+                    energy[k],
+                    smooth_k,
+                )
+                means = np.zeros(3)
+                for c in range(n_comb):
+                    means[0] += u_weights[c] * el_now[j, c]
+                    means[1] += u_weights[c] * cap_now[j, c]
+                    means[2] += u_weights[c] * fis_now[j, c]
+                for c in range(n_comb):
+                    if means[0] > 0.0 and exact[0] > 0.0:
+                        el_now[j, c] *= exact[0] / means[0]
+                    if means[1] > 0.0 and exact[1] > 0.0:
+                        cap_now[j, c] *= exact[1] / means[1]
+                    if means[2] > 0.0 and exact[2] > 0.0:
+                        fis_now[j, c] *= exact[2] / means[2]
+                    tot_now[j, c] = el_now[j, c] + cap_now[j, c] + fis_now[j, c] + smooth_k[3]
+            else:
+                for c in range(n_comb):
+                    el_now[j, c] = scatter[t, k]
+                    tot_now[j, c] = removal[t, k]
+                    cap_now[j, c] = u_smooth[j, 1, k]
+                    fis_now[j, c] = u_smooth[j, 2, k]
+        if k < start:
+            continue
+        banded = any_now
+        for j in range(n_banded):
+            if in_before[j]:
+                banded = True
+        if banded:
+            for c in range(n_comb):
+                d_band[c] = 0.0
+                g_band[c] = 0.0
+        common_own = 0.0
         for t in range(n_terms):
-            lhs += d_removal[t] * removal[t, k]
+            jt = band_of[t]
+            # A banded term takes the band path where its tables apply at this node or the last.
+            split = banded and jt >= 0 and (in_now[jt] or in_before[jt])
+            if split:
+                for c in range(n_comb):
+                    d_band[c] += d_removal[t] * tot_now[jt, c]
+            else:
+                lhs += d_removal[t] * removal[t, k]
             if k == 0:
                 continue
             sigma = scatter[t]
@@ -254,8 +409,15 @@ def _march(
                 running[t, k - 1] = 0.0
                 block_start[t] = k - 1
             i = 1.0 / energy[k - 1]
-            known = running[t, k - 1] + i * flux[k - 1] * (sigma[k - 1] * w[0] + sigma[k] * w[2])
-            own = i * (sigma[k - 1] * w[1] + sigma[k] * w[3])
+            if split:
+                panel = 0.0
+                for c in range(n_comb):
+                    panel += f_before[c] * (el_before[jt, c] * w[0] + el_now[jt, c] * w[2])
+                known = running[t, k - 1] + i * panel
+            else:
+                panel = flux[k - 1] * (sigma[k - 1] * w[0] + sigma[k] * w[2])
+                known = running[t, k - 1] + i * panel
+            own = i * (sigma[k - 1] * w[1] + sigma[k] * w[3]) if not split else 0.0
             factor = energy[k] / (1.0 - alpha[t])
             window = known
             if alpha[t] > 0.0:
@@ -317,14 +479,60 @@ def _march(
                     # The whole window is on the grid and above the cutoff, so this should vanish.
                     # A window crossing either is truly cut short; see the kernel.
                     own -= mean * sigma[k]
-            lhs -= d_scatter[t] * factor * own
+            if split:
+                # own holds the anisotropic part only, taken as common to every band.
+                for c in range(n_comb):
+                    band_own = i * (el_before[jt, c] * w[1] + el_now[jt, c] * w[3]) + own
+                    g_band[c] += d_scatter[t] * factor * band_own
+            elif banded:
+                common_own += d_scatter[t] * factor * own
+            else:
+                lhs -= d_scatter[t] * factor * own
             rhs += d_scatter[t] * factor * window
             running[t, k] = known  # completed below, once F[k] is known
         m = node_m[k]
         theta = node_theta[k]
         rhs += (1.0 - theta) * coarse_source[m] / hat[m] + theta * coarse_source[m + 1] / hat[m + 1]
-        diagonal[k] = lhs
-        flux[k] = rhs / lhs
+        if banded:
+            coupling = 0.0
+            for c in range(n_comb):
+                d_band[c] += lhs
+                g_band[c] += common_own
+                coupling += u_weights[c] * g_band[c] / d_band[c]
+            shared = rhs / (1.0 - coupling)
+            total = 0.0
+            for c in range(n_comb):
+                f_now[c] = u_weights[c] * shared / d_band[c]
+                total += f_now[c]
+            flux[k] = total
+            # The effective diagonal, whatever the source; a band at or below zero is reported.
+            inverse = 0.0
+            lowest = d_band[0]
+            for c in range(n_comb):
+                inverse += u_weights[c] / d_band[c]
+                lowest = min(lowest, d_band[c])
+            diagonal[k] = (1.0 - coupling) / inverse
+            if lowest <= 0.0:
+                diagonal[k] = min(diagonal[k], lowest)
+            for j in range(n_banded):
+                if not in_now[j]:
+                    continue
+                t = u_terms[j]
+                sums = np.zeros(4)
+                for c in range(n_comb):
+                    sums[0] += tot_now[j, c] * f_now[c]
+                    sums[1] += el_now[j, c] * f_now[c]
+                    sums[2] += cap_now[j, c] * f_now[c]
+                    sums[3] += fis_now[j, c] * f_now[c]
+                if total != 0.0:
+                    for q in range(4):
+                        shield[j, q, k] = sums[q] / total
+                    scatter[t, k] = shield[j, 1, k]
+        else:
+            diagonal[k] = lhs
+            flux[k] = rhs / lhs
+            for c in range(n_comb):
+                f_now[c] = u_weights[c] * flux[k]
         if k > 0 and values.shape[0] > 0:
             p = panel_m[k - 1]
             w = rates[k - 1]
@@ -346,12 +554,23 @@ def _march(
             for t in range(n_terms):
                 sigma = scatter[t]
                 w = weights[k - 1]
-                running[t, k] += flux[k] * (sigma[k - 1] * w[1] + sigma[k] * w[3]) / energy[k - 1]
+                jt = band_of[t]
+                if banded and jt >= 0 and (in_now[jt] or in_before[jt]):
+                    panel = 0.0
+                    for c in range(n_comb):
+                        panel += f_now[c] * (el_before[jt, c] * w[1] + el_now[jt, c] * w[3])
+                    running[t, k] += panel / energy[k - 1]
+                else:
+                    running[t, k] += (
+                        flux[k] * (sigma[k - 1] * w[1] + sigma[k] * w[3]) / energy[k - 1]
+                    )
                 if slot[t] >= 0 and k - 1 < tree_panels:
                     moment_tree_add(
                         trees[slot[t]], size, energy, sigma, flux, moment_weights, k - 1
                     )
-    return flux, diagonal, restricted
+        for c in range(n_comb):
+            f_before[c] = f_now[c]
+    return flux, diagonal, restricted, shield
 
 
 @njit
@@ -381,6 +600,75 @@ def upscatter_block(kernels):
     # Nodes in interval m take a share of hat m + 1, so a deposit in hat reach drives F from the
     # top of interval reach - 1.
     return first_hat, int(kernels.coarse_index[max(reach - 1, 0)])
+
+
+def march(ops, removal, scatter, streaming, source, lagged, start=0, anisotropy="separable"):
+    """One march from node start with lagged hat emission (terms, coarse nodes): (flux, diagonal,
+    restricted emission, shield). removal is (terms) and scatter (terms, 1), as solve_energy takes
+    them; F is zero above start, and source must be too."""
+    kernels = ops.inelastic
+    n_coarse = kernels.coarse.shape[0]
+    removal = np.asarray(removal, dtype=float)
+    scatter = np.asarray(scatter, dtype=float)
+    source = np.asarray(source, dtype=float)
+    lagged = np.asarray(lagged, dtype=float)
+    coarse_source = _lagged_source(
+        scatter[:, 0],
+        lagged,
+        kernels.starts,
+        kernels.first,
+        kernels.last,
+        kernels.values,
+        n_coarse,
+    )
+    return _march(
+        ops.energy,
+        ops.removal,
+        ops.scatter,
+        ops.alpha,
+        ops.emission_weights,
+        removal,
+        scatter[:, 0],
+        float(streaming),
+        source,
+        ops.angle.tables,
+        ops.angle.table_energy,
+        ops.angle.points,
+        ops.angle.mu,
+        ops.angle.pdf,
+        ops.angle.cutoff,
+        ops.angle.peak,
+        ops.rate_weights,
+        kernels.emission,
+        kernels.hat,
+        kernels.coarse_index,
+        ops.panel_m,
+        ops.panel_share,
+        ops.node_m,
+        ops.node_theta,
+        kernels.starts,
+        kernels.first,
+        kernels.last,
+        kernels.values,
+        lagged,
+        coarse_source,
+        anisotropy == "separable",
+        ops.moment_weights,
+        start,
+        ops.urr.terms,
+        ops.urr.start,
+        ops.urr.bands,
+        ops.urr.energy,
+        ops.urr.cdf,
+        ops.urr.elastic,
+        ops.urr.fission,
+        ops.urr.capture,
+        ops.urr.multiply,
+        ops.urr.rule,
+        ops.urr.smooth,
+        ops.urr.points,
+        ops.urr.weights,
+    )
 
 
 def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable", initial=None):
@@ -418,61 +706,18 @@ def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable
             raise ValueError(f"shape: initial {lagged.shape} must be {(n_terms, n_coarse)}")
 
     def sweep(source, lagged, start):
-        coarse_source = _lagged_source(
-            scatter[:, 0],
-            lagged,
-            kernels.starts,
-            kernels.first,
-            kernels.last,
-            kernels.values,
-            n_coarse,
-        )
-        return _march(
-            ops.energy,
-            ops.removal,
-            ops.scatter,
-            ops.alpha,
-            ops.emission_weights,
-            removal,
-            scatter[:, 0],
-            float(streaming),
-            source,
-            ops.angle.tables,
-            ops.angle.table_energy,
-            ops.angle.points,
-            ops.angle.mu,
-            ops.angle.pdf,
-            ops.angle.cutoff,
-            ops.angle.peak,
-            ops.rate_weights,
-            kernels.emission,
-            kernels.hat,
-            kernels.coarse_index,
-            ops.panel_m,
-            ops.panel_share,
-            ops.node_m,
-            ops.node_theta,
-            kernels.starts,
-            kernels.first,
-            kernels.last,
-            kernels.values,
-            lagged,
-            coarse_source,
-            anisotropy == "separable",
-            ops.moment_weights,
-            start,
-        )
+        return march(ops, removal, scatter, streaming, source, lagged, start, anisotropy)
 
     block = upscatter_block(kernels) if kernels.values.shape[0] > 0 else None
     applications = 0
     for count in range(1, MAX_SWEEPS + 1):
-        flux, diagonal, restricted = sweep(source, lagged, 0)
+        flux, diagonal, restricted, shield = sweep(source, lagged, 0)
         scale = np.abs(restricted).max()
         if (
             kernels.values.shape[0] == 0
             or np.abs(restricted - lagged).max() <= SWEEP_TOLERANCE * scale
         ):
-            return EnergySolution(flux, diagonal, count, applications)
+            return EnergySolution(flux, diagonal, count, applications, shield)
         if block is None:
             lagged = restricted
             continue

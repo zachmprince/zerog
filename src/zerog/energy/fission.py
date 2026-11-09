@@ -383,3 +383,25 @@ def fission_source(ops, kernels, densities, flux):
     m = ops.node_m
     theta = ops.node_theta
     return (1.0 - theta) * values[m] / kernels.hat[m] + theta * values[m + 1] / kernels.hat[m + 1]
+
+
+def shield_fission(kernels, urr, shield, energy):
+    """Fission kernels whose production is self-shielded where probability tables apply: each
+    banded term's components scaled by its shielded over its smooth fission cross section.
+
+    shield is zerog.energy.subproblem.EnergySolution.shield, for urr = ops.urr.
+    """
+    if shield is None or urr.terms.shape[0] == 0:
+        return kernels
+    from zerog.energy.urr import SHIELD_FISSION, inside
+
+    production = np.array(kernels.production, dtype=float, copy=True)
+    for j, t in enumerate(urr.terms):
+        where = inside(urr, j, energy)
+        smooth = urr.smooth[j, 2]
+        factor = np.ones(energy.shape[0])
+        positive = where & (smooth > 0.0)
+        factor[positive] = shield[j, SHIELD_FISSION, positive] / smooth[positive]
+        for k in np.nonzero(kernels.term == t)[0]:
+            production[k] = production[k] * factor
+    return FissionKernels(**{**kernels.__dict__, "production": production})

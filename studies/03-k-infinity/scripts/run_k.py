@@ -20,11 +20,17 @@ TWIN = Path(__file__).parents[3] / "benchmarks" / "05-fast-k-infinity"
 CACHE = Path(__file__).parent / "results" / "kernels"
 
 
-def solve_case(name, rtol=1e-3, subdivide=1, light=None, curves="all", twin=TWIN):
+def solve_case(
+    name, rtol=1e-3, subdivide=1, light=None, curves="all", twin=TWIN, bands=0, summary=None
+):
     """Build a case's mix, solve k, and compare it with the twin. Returns (mix, solution,
-    comparison, closure, build seconds, solve seconds)."""
+    comparison, closure, build seconds, solve seconds).
+
+    bands turns probability tables on with that many combinations (zerog.energy.mix.build_mix).
+    summary names the twin's summary, by default the case's own, such as "sfr-ptables".
+    """
     case = CASES[name]
-    summary = json.loads((Path(twin) / f"{name}.json").read_text())
+    summary = json.loads((Path(twin) / f"{summary or name}.json").read_text())
     start = time.perf_counter()
     mix = build_mix(
         case["densities"],
@@ -38,15 +44,17 @@ def solve_case(name, rtol=1e-3, subdivide=1, light=None, curves="all", twin=TWIN
         required=np.array(summary["edges_low"]),
         light=light,
         cache=CACHE,
+        bands=bands,
     )
     built = time.perf_counter() - start
     d = mix.densities
     start = time.perf_counter()
     solution = solve_k(mix.ops, mix.fission, d, d[:, None], 0.0, d)
     solved = time.perf_counter() - start
-    source = fission_source(mix.ops, mix.fission, d, solution.flux) / solution.k
-    balance = energy_balance(mix.ops, d, d[:, None], 0.0, source, solution.flux)
-    comparison = compare(mix, solution.k, solution.flux, summary)
+    fission = solution.fission if solution.fission is not None else mix.fission
+    source = fission_source(mix.ops, fission, d, solution.flux) / solution.k
+    balance = energy_balance(mix.ops, d, d[:, None], 0.0, source, solution.flux, solution.shield)
+    comparison = compare(mix, solution.k, solution.flux, summary, solution.shield, fission)
     return mix, solution, comparison, balance.residual / balance.source, built, solved
 
 

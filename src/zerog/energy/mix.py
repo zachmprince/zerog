@@ -24,6 +24,7 @@ from zerog.energy.terms import (
     transport_grid,
 )
 from zerog.energy.thermal import build_thermal
+from zerog.energy.urr import build_urr, urr_required
 
 LIBRARY_BOTTOM = 1.0e-5  # eV, the bottom of ENDF/B-VIII.0's neutron grids
 
@@ -63,6 +64,7 @@ def build_mix(
     light=None,
     cache=None,
     atol=1e-8,
+    bands=0,
 ):
     """Assemble a mix of {name: atoms/b-cm} at a library temperature label.
 
@@ -70,7 +72,8 @@ def build_mix(
     Thermal scattering applies to every nuclide whose free gas top lies above energy_min; light
     sets the top, in kT, for targets of awr <= 1 (terms.thermal_spec). rtol, subdivide and curves
     choose the grid (terms.transport_grid), and required energies are added to it. cache is a
-    directory for inelastic and thermal kernels.
+    directory for inelastic and thermal kernels. bands, a power of two, turns probability tables on
+    with that many band combinations (zerog.energy.urr); 0 leaves them off.
     """
     names = list(densities)
     density = np.array([densities[n] for n in names], dtype=float)
@@ -86,6 +89,7 @@ def build_mix(
             fission_nodes(nuclides, top, energy_min),
             np.asarray(required, dtype=float),
             *[thermal_required(s, energy_min) for s in thermal],
+            urr_required(nuclides) if bands else np.empty(0),
         ]
     )
     energy, coarse = transport_grid(
@@ -115,5 +119,6 @@ def build_mix(
         [t.alpha for t in terms],
         [t.angle for t in terms],
         kernels,
+        build_urr(nuclides, energy, bands) if bands else None,
     )
     return Mix(names, label, density, energy, coarse, top, energy_min, terms, specs, ops, fission)

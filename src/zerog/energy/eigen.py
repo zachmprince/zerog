@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from zerog.energy.fission import fission_hats, fission_source, production_rates
+from zerog.energy.fission import fission_hats, fission_source, production_rates, shield_fission
 from zerog.energy.inelastic import restrict
 from zerog.energy.subproblem import solve_energy
 
@@ -28,6 +28,8 @@ class EigenSolution:
     sweeps: int
     history: np.ndarray  # k after each iteration
     block_marches: int = 0
+    shield: np.ndarray | None = None  # as EnergySolution.shield, for the last solve
+    fission: object = None  # the fission kernels shielded by it
 
 
 def solve_k(ops, fission, removal, scatter, streaming, production, anisotropy="separable"):
@@ -48,8 +50,9 @@ def solve_k(ops, fission, removal, scatter, streaming, production, anisotropy="s
     history = []
     sweeps = 0
     marches = 0
+    current = fission
     for iteration in range(1, MAX_ITERATIONS + 1):
-        source = fission_source(ops, fission, production, flux) / k
+        source = fission_source(ops, current, production, flux) / k
         # The last flux's inelastic emission starts the lagged sweeps, since it changes little.
         initial = (
             restrict(ops.inelastic, ops.energy, flux, ops.rate_weights) if iteration > 1 else None
@@ -57,17 +60,28 @@ def solve_k(ops, fission, removal, scatter, streaming, production, anisotropy="s
         solution = solve_energy(ops, removal, scatter, streaming, source, anisotropy, initial)
         sweeps += solution.sweeps
         marches += solution.block_marches
+        # Where probability tables apply, production follows the bands' shielded fission.
+        current = shield_fission(fission, ops.urr, solution.shield, ops.energy)
         produced = production_rates(
-            fission, production, ops.energy, solution.flux, ops.rate_weights
+            current, production, ops.energy, solution.flux, ops.rate_weights
         ).sum()
         # The last flux produced one neutron, emitted as 1 / k.
         k_new = k * produced
         flux = solution.flux / produced
-        new_shape, _ = fission_hats(fission, production, ops.energy, flux, ops.rate_weights)
+        new_shape, _ = fission_hats(current, production, ops.energy, flux, ops.rate_weights)
         history.append(k_new)
         change = np.abs(new_shape - shape).max() / np.abs(new_shape).max()
         if abs(k_new - k) <= K_TOLERANCE * k_new and change <= SOURCE_TOLERANCE:
-            return EigenSolution(k_new, flux, iteration, sweeps, np.array(history), marches)
+            return EigenSolution(
+                k_new,
+                flux,
+                iteration,
+                sweeps,
+                np.array(history),
+                marches,
+                solution.shield,
+                current,
+            )
         k = k_new
         shape = new_shape
     raise RuntimeError(f"power iteration did not converge in {MAX_ITERATIONS} iterations")

@@ -81,24 +81,35 @@ class TwinComparison:
         return "\n".join(lines)
 
 
-def compare(mix, k, flux, summary):
+def compare(mix, k, flux, summary, shield=None, fission=None):
     """Compare a zerog.energy.mix.Mix's eigenvalue solution (k, flux) with a twin summary.
 
-    Rates are (n,gamma), fission and nu-fission for the mix's nuclides; others are skipped.
+    Rates are (n,gamma), fission and nu-fission for the mix's nuclides; others are skipped. With
+    probability tables, pass the solution's shield and shielded fission kernels: OpenMC scores
+    (n,gamma) there as the band's absorption less fission, and fission as the band's.
     """
+    from zerog.energy.urr import SHIELD_CAPTURE, SHIELD_FISSION, shielded
+
     ops = mix.ops
     energy = mix.energy
     scaled = k * flux
-    produced = production_rates(mix.fission, mix.densities, energy, scaled, ops.rate_weights)
+    kernels = fission
+    if kernels is None:
+        from zerog.energy.fission import shield_fission
+
+        kernels = shield_fission(mix.fission, ops.urr, shield, energy)
+    produced = production_rates(kernels, mix.densities, energy, scaled, ops.rate_weights)
     rates = []
     for row in summary["rates"]:
         if row["nuclide"] not in mix.names or row["mean"] <= 0.0:
             continue
         i = mix.names.index(row["nuclide"])
         if row["score"] == "(n,gamma)":
-            ours = mix.densities[i] * panel_rate(mix.terms[i].capture, scaled, ops.rate_weights)
+            curve = shielded(ops.urr, shield, i, SHIELD_CAPTURE, mix.terms[i].capture, energy)
+            ours = mix.densities[i] * panel_rate(curve, scaled, ops.rate_weights)
         elif row["score"] == "fission":
-            ours = mix.densities[i] * panel_rate(mix.fission_xs(i), scaled, ops.rate_weights)
+            curve = shielded(ops.urr, shield, i, SHIELD_FISSION, mix.fission_xs(i), energy)
+            ours = mix.densities[i] * panel_rate(curve, scaled, ops.rate_weights)
         elif row["score"] == "nu-fission":
             ours = produced[i]
         else:

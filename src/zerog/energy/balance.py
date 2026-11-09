@@ -104,25 +104,46 @@ def _lost_below_anisotropic(
     return total
 
 
-def energy_balance(ops, removal, scatter, streaming, source, flux):
-    """Balance of a solve_energy result; arguments as there."""
+def energy_balance(ops, removal, scatter, streaming, source, flux, shield=None):
+    """Balance of a solve_energy result; arguments as there. shield is the solution's, for a
+    problem with probability tables: removal and elastic emission then take the bands' shielded
+    cross sections where the tables apply."""
     removal = np.asarray(removal, dtype=float)
     scatter = np.asarray(scatter, dtype=float)
+    total_xs = ops.removal
+    elastic_xs = ops.scatter
+    if shield is None and ops.urr.terms.shape[0]:
+        raise ValueError("this problem has probability tables: pass the solution's shield")
+    if shield is not None and ops.urr.terms.shape[0]:
+        from zerog.energy.urr import SHIELD_ELASTIC, SHIELD_TOTAL, shielded
+
+        total_xs = np.array(
+            [
+                shielded(ops.urr, shield, t, SHIELD_TOTAL, c, ops.energy)
+                for t, c in enumerate(total_xs)
+            ]
+        )
+        elastic_xs = np.array(
+            [
+                shielded(ops.urr, shield, t, SHIELD_ELASTIC, c, ops.energy)
+                for t, c in enumerate(elastic_xs)
+            ]
+        )
     unit = np.ones(flux.shape[0])
     src = panel_rate(np.ones_like(flux), np.asarray(source, dtype=float), ops.rate_weights)
     removed = streaming * panel_rate(unit, flux, ops.rate_weights)
     emitted = 0.0
     lost = 0.0
     for t in range(ops.removal.shape[0]):
-        removed += removal[t] * panel_rate(ops.removal[t], flux, ops.rate_weights)
-        emitted += scatter[t, 0] * panel_rate(ops.scatter[t], flux, ops.rate_weights)
+        removed += removal[t] * panel_rate(total_xs[t], flux, ops.rate_weights)
+        emitted += scatter[t, 0] * panel_rate(elastic_xs[t], flux, ops.rate_weights)
         lost += scatter[t, 0] * _lost_below(
-            ops.energy, ops.scatter[t], ops.alpha[t], flux, _GAUSS_S, _GAUSS_W
+            ops.energy, elastic_xs[t], ops.alpha[t], flux, _GAUSS_S, _GAUSS_W
         )
         if np.isfinite(ops.angle.cutoff[t]):
             lost += scatter[t, 0] * _lost_below_anisotropic(
                 ops.energy,
-                ops.scatter[t],
+                elastic_xs[t],
                 ops.alpha[t],
                 flux,
                 ops.angle.cutoff[t],
