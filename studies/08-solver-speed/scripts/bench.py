@@ -86,8 +86,6 @@ def stage_timers(timings):
 
 
 def kernel(names, spacing=None):
-    import os
-
     spacing = float(os.environ.get("SPACING", 5e-4)) if spacing is None else spacing
     energy = 2e7 * np.exp(-np.arange(0.0, np.log(2e7 / 1e3), spacing))
     n = energy.shape[0]
@@ -100,8 +98,9 @@ def kernel(names, spacing=None):
         ones = np.ones((1, n))
         iso = build_operators(energy, 2.0 * ones, ones, alpha)
         aniso = build_operators(energy, 2.0 * ones, ones, alpha, angle=[angle])
+        order = int(os.environ.get("LORDER", 8))  # the Legendre form everywhere, at this order
         legendre = build_operators(
-            energy, 2.0 * ones, ones, alpha, angle=[angle], legendre=(int(__import__("os").environ.get("LORDER", 8)), 1.0)
+            energy, 2.0 * ones, ones, alpha, angle=[angle], legendre=(order, 1.0)
         )
         lagged = np.zeros((1, aniso.inelastic.coarse.shape[0]))
         above = int((energy > aniso.angle.cutoff[0]).sum())
