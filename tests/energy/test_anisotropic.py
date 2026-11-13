@@ -630,27 +630,62 @@ def test_legendre_coefficients_conserve_and_flag_tables_by_truncation_error():
     np.testing.assert_allclose(b @ integrals, 0.0, atol=1e-12)
 
 
-def test_light_targets_keep_the_exact_form():
-    # A window as wide as the grid would put rho near 1 / alpha into the running moments' powers,
-    # so targets lighter than LEGENDRE_MIN_ALPHA (hydrogen's alpha is 2e-7, not 0) march exactly.
+def test_light_targets_take_the_legendre_form_only_below_their_bottom():
+    # A light target's window holds rho up to 1 / alpha (hydrogen's alpha is 2e-7, not 0), so it
+    # keeps the exact form down to its anisotropy bottom. Below, its windows run from the bottom up
+    # to their edge, which cumulative moments take well conditioned; with linear tables that is
+    # exact, so both forms must agree to round-off.
     from zerog.energy.elastic import LEGENDRE_MIN_ALPHA
 
-    table = tables_from(*LINEAR)
-    energy = TOP * np.exp(-np.linspace(0.0, 4.0, 200))
-    sigma = np.ones((2, 200))
+    mu, pdf = np.array([-1.0, 1.0]), np.array([0.5, 1.5]) / 2.0
+    flat = np.array([0.5, 0.5])
+    table = AngleTables(
+        energy=np.array([2.0e7, 1.0e5, 1.0e5, 1.0e-5]),
+        offsets=np.arange(5) * 2,
+        interpolation=np.full(4, 2, dtype=np.int64),
+        mu=np.tile(mu, 4),
+        pdf=np.concatenate([pdf, pdf, flat, flat]),
+        cdf=np.zeros(8),
+    )
+    n = 400
+    energy = TOP * np.exp(-np.linspace(0.0, 6.0, n))
+    sigma = (1.0 + 0.3 * np.sin(np.arange(n) * 0.1))[None, :].repeat(2, axis=0)
     alphas = [1.7e-7, kinematic_alpha(11.9)]
     assert alphas[0] < LEGENDRE_MIN_ALPHA < alphas[1]
-    source = np.exp(-np.arange(200) / 20.0)
+    source = np.exp(-np.arange(n) / 20.0)
     d = np.array([0.5, 0.5])
-    flux = {
-        legendre: solve_energy(
-            build_operators(energy, 1.2 * sigma, sigma, alphas, [table, table], legendre=legendre),
-            d,
-            d[:, None],
-            0.1,
-            source,
-        ).flux
-        for legendre in (None, (2, 1.0))
-    }
+    flux = {}
+    for legendre in (None, (2, 1.0)):
+        ops = build_operators(energy, 1.2 * sigma, sigma, alphas, [table, table], legendre=legendre)
+        assert energy[-1] < ops.angle.cutoff[0] < energy[0]
+        flux[legendre] = solve_energy(ops, d, d[:, None], 0.1, source).flux
     assert np.all(np.isfinite(flux[(2, 1.0)]))
-    np.testing.assert_allclose(flux[(2, 1.0)], flux[None], rtol=1e-13)
+    np.testing.assert_allclose(flux[(2, 1.0)], flux[None], rtol=1e-12)
+
+
+def test_upscatter_block_marches_skip_anisotropy_above_their_start():
+    # F is zero above a march's start, so terms whose anisotropy ends above it add nothing: the
+    # march from start must equal the full one with zero source and emission above start.
+    from zerog.energy.subproblem import march
+
+    mu = np.array(PEAKED[0])
+    peak = np.array(PEAKED[1]) / np.trapezoid(PEAKED[1], PEAKED[0])
+    flat = np.full(mu.shape[0], 0.5)
+    table = AngleTables(
+        energy=np.array([2.0e7, 1.0e5, 1.0e5, 1.0e-5]),
+        offsets=np.arange(5) * mu.shape[0],
+        interpolation=np.full(4, 2, dtype=np.int64),
+        mu=np.tile(mu, 4),
+        pdf=np.concatenate([peak, peak, flat, flat]),
+        cdf=np.zeros(4 * mu.shape[0]),
+    )
+    n = 300
+    energy = TOP * np.exp(-np.linspace(0.0, 6.0, n))
+    sigma = np.ones((1, n))
+    ops = build_operators(energy, 1.2 * sigma, sigma, [kinematic_alpha(11.9)], [table])
+    start = int(np.searchsorted(-energy, -ops.angle.cutoff[0])) + 20
+    source = np.where(np.arange(n) >= start, 1.0, 0.0)
+    lagged = np.zeros((1, ops.inelastic.coarse.shape[0]))
+    below = march(ops, [1.0], [[0.6]], 0.1, source, lagged, start)[0]
+    full = march(ops, [1.0], [[0.6]], 0.1, source, lagged, 0)[0]
+    np.testing.assert_allclose(below, full, rtol=1e-14, atol=0.0)

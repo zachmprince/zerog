@@ -22,6 +22,10 @@ TWIN = Path(__file__).parents[3] / "benchmarks" / "05-fast-k-infinity"
 # Kernels are rebuilt each run (minutes), not cached: caches ran to tens of GB per study.
 # Set ZEROG_KERNEL_CACHE to a directory to keep them.
 CACHE = os.environ.get("ZEROG_KERNEL_CACHE")
+# ZEROG_LEGENDRE="8,1" builds the anisotropic windows' Legendre form (subproblem.build_operators),
+# an approximation; unset keeps the exact form (study 08).
+_order, _, _tolerance = os.environ.get("ZEROG_LEGENDRE", "").partition(",")
+LEGENDRE = (int(_order), float(_tolerance)) if _order else None
 
 
 def solve_case(
@@ -49,6 +53,7 @@ def solve_case(
         light=light,
         cache=CACHE,
         bands=bands,
+        legendre=LEGENDRE,
     )
     built = time.perf_counter() - start
     d = mix.densities

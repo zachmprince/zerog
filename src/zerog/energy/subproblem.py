@@ -40,7 +40,10 @@ SWEEP_TOLERANCE = 1e-12  # on the hats' emission, relative to the largest
 # below its truncation error, on which the exact tolerance would stall (elastic.LEGENDRE_MAX_ORDER).
 LEGENDRE_SWEEP_TOLERANCE = 1e-10
 BLOCK_RESTARTS = 20  # GMRES restart cycles per block solve
-BLOCK_RTOL = 1e-10  # GMRES stop relative to the block's right-hand side
+# GMRES stop relative to the block's right-hand side. Each sweep's block solve only has to beat the
+# next sweep's change, so 1e-4 takes 32 block marches where 1e-10 took 44 on study 03's PWR at 1%,
+# for the same flux to 7e-15; 1e-1 doubled the sweeps (study 08).
+BLOCK_RTOL = 1e-4
 UPSCATTER_SHARE = 1e-6  # share of a hat's row above its upper neighbour that calls for the block
 # The anisotropic elastic window: the direct sum (the oracle), the moment tree with quadrature of f
 # on every cut panel (decision 008), and the tree with each knot's cut shared between its segments.
@@ -445,9 +448,81 @@ def _legendre_window(
     return known, own
 
 
-# Not cached: Numba's cache does not notice changes to a callee in another file, so a cached caller
-# would keep running the old kernel.
-@njit(error_model="numpy")
+@njit(error_model="numpy", inline="always")
+def _light_window(
+    energy,
+    widths,
+    k,
+    sigma,
+    flux,
+    alpha,
+    j,
+    reach,
+    cumulative,
+    legendre_b,
+    low,
+    high,
+    table_energy,
+    binomial,
+    part_a,
+    part_b,
+    span_sum,
+    scratch,
+):
+    """The Legendre form's window of node k below a light target's bottom node, reach: from the
+    bottom up to min(energy[k] / alpha, the grid's top), with no unknown in it.
+
+    cumulative[m] holds the moments of panels 0 .. m - 1 with v = energy[reach] / E', in (0, 1],
+    so x = (c energy[k] / energy[reach]) v + d and |rho v| + |tau| stays under 3 however light
+    the target. j is the panel holding the edge, if the edge is below the grid's top.
+    """
+    order = legendre_b.shape[1] - 1
+    n_moments = span_sum.shape[0]
+    c = 2.0 / (1.0 - alpha)
+    d = -(1.0 + alpha) / (1.0 - alpha)
+    target = energy[k]
+    bottom = energy[reach]
+    edge = target / alpha if alpha > 0.0 else np.inf
+    if edge >= energy[0]:
+        for q in range(n_moments):
+            span_sum[q] = cumulative[reach, q]
+    else:
+        if j >= reach:
+            return 0.0
+        # Panels below j, and panel j's part below the edge.
+        for q in range(n_moments):
+            part_a[q] = 0.0
+            part_b[q] = 0.0
+        legendre_panel_moments(
+            energy,
+            sigma,
+            j,
+            widths[j],
+            edge,
+            energy[j + 1],
+            bottom,
+            0.0,
+            legendre_b,
+            low,
+            high,
+            table_energy,
+            part_a,
+            part_b,
+            scratch,
+        )
+        for q in range(n_moments):
+            span_sum[q] = (
+                cumulative[reach, q]
+                - cumulative[j + 1, q]
+                + flux[j] * part_a[q]
+                + flux[j + 1] * part_b[q]
+            )
+    return legendre_combine(span_sum, c * target / bottom, d, order, binomial, scratch)
+
+
+# Cached, but Numba's cache only notices changes to this file, and a cached _march would keep
+# running an old callee from elastic.py or urr.py; _forget_stale_march drops it when they change.
+@njit(error_model="numpy", cache=True)
 def _march(
     energy,
     removal,
@@ -554,6 +629,13 @@ def _march(
     legendre_slot = np.full(n_terms, -1)
     legendre_reach = np.zeros(n_terms, dtype=np.int64)
     n_legendre = 0
+    active = np.zeros(n_terms, dtype=np.bool_)
+    term_reach = np.zeros(n_terms, dtype=np.int64)
+    # Light targets in the Legendre form: below their bottom node a window is the fixed range from
+    # the bottom up to its edge, so cumulative moments from the grid's top serve every node there.
+    light_slot = np.full(n_terms, -1)
+    light_reach = 0
+    n_light = 0
     # Panels the moment trees must hold: windows never reach below a term's bottom node.
     tree_panels = 0
     for t in range(n_terms):
@@ -563,19 +645,27 @@ def _march(
                 bottom[t] = energy[m]
                 reach = m
                 break
-        if separable and cutoff[t] < np.inf:
+        # Windows take no panel below reach, and F is zero on every panel above start, so a march
+        # starting below reach (an upscatter block's) has no anisotropic part for this term.
+        term_reach[t] = reach
+        active[t] = cutoff[t] < np.inf and start <= reach
+        if separable and active[t]:
             slot[t] = n_slots
             n_slots += 1
             tree_panels = max(tree_panels, reach)
-        if (
-            separable
-            and cutoff[t] < np.inf
-            and alpha[t] >= LEGENDRE_MIN_ALPHA
-            and legendre_switch[t] > 0.0
-        ):
+        if separable and active[t] and alpha[t] >= LEGENDRE_MIN_ALPHA and legendre_switch[t] > 0.0:
             legendre_slot[t] = n_legendre
             legendre_reach[t] = reach
             n_legendre += 1
+        if (
+            separable
+            and active[t]
+            and alpha[t] < LEGENDRE_MIN_ALPHA
+            and legendre_switch[t] >= energy[0]
+        ):
+            light_slot[t] = n_light
+            light_reach = max(light_reach, reach)
+            n_light += 1
     size = moment_tree_size(tree_panels + 1)
     # The Legendre form's running moments per term (elastic.legendre_panel_moments): the current
     # block's from its top node down to the last panel solved, the whole previous block's, and the
@@ -596,6 +686,7 @@ def _march(
                 far += 1
             capacity = max(capacity, m - far + 4)
     stored = np.zeros((n_legendre, capacity, n_moments))
+    cumulative = np.zeros((n_light, light_reach + 1 if n_light > 0 else 0, n_moments))
     current = np.zeros((n_legendre, n_moments))
     previous = np.zeros((n_legendre, n_moments))
     top_sum = np.zeros((n_legendre, n_moments))
@@ -812,6 +903,28 @@ def _march(
                 own_ready[ls] = k - 1 < legendre_reach[t]
                 window += extra
                 own += extra_own
+            elif light_slot[t] >= 0 and k > term_reach[t]:
+                extra = _light_window(
+                    energy,
+                    widths,
+                    k,
+                    sigma,
+                    flux,
+                    alpha[t],
+                    pointer[t],
+                    term_reach[t],
+                    cumulative[light_slot[t]],
+                    legendre_b,
+                    tables[t],
+                    tables[t + 1],
+                    table_energy,
+                    binomial,
+                    part_a,
+                    part_b,
+                    span_sum,
+                    scratch,
+                )
+                window += extra
             elif slot[t] >= 0 and energy[pointer[t]] > cutoff[t]:
                 extra, extra_own = separable_correction(
                     energy,
@@ -834,7 +947,7 @@ def _march(
                 )
                 window += extra
                 own += extra_own
-            elif energy[pointer[t]] > cutoff[t]:
+            elif active[t] and energy[pointer[t]] > cutoff[t]:
                 extra, extra_own, mean = anisotropic_correction(
                     energy,
                     k,
@@ -956,6 +1069,32 @@ def _march(
                     moment_tree_add(
                         trees[slot[t]], size, energy, sigma, flux, moment_weights, k - 1
                     )
+                lt = light_slot[t]
+                if lt >= 0 and energy[k - 1] > bottom[t]:
+                    for q in range(n_moments):
+                        part_a[q] = 0.0
+                        part_b[q] = 0.0
+                    legendre_panel_moments(
+                        energy,
+                        sigma,
+                        k - 1,
+                        widths[k - 1],
+                        energy[k - 1],
+                        energy[k],
+                        bottom[t],
+                        0.0,
+                        legendre_b,
+                        tables[t],
+                        tables[t + 1],
+                        table_energy,
+                        part_a,
+                        part_b,
+                        scratch,
+                    )
+                    for q in range(n_moments):
+                        cumulative[lt, k, q] = (
+                            cumulative[lt, k - 1, q] + flux[k - 1] * part_a[q] + flux[k] * part_b[q]
+                        )
                 ls = legendre_slot[t]
                 if ls >= 0 and k - 1 < legendre_reach[t]:
                     # Banded terms' sigma at k changed with the solve, so their panel is redone.
@@ -991,12 +1130,41 @@ def _march(
     return flux, diagonal, restricted, shield
 
 
+def _forget_stale_march():
+    """Delete _march's cached machine code if a file it inlines or calls has changed since it was
+    cached, so Numba compiles it afresh; a hash of those files is kept beside the cache."""
+    import hashlib
+    from pathlib import Path
+
+    from zerog.energy import elastic, urr
+
+    digest = hashlib.sha256()
+    for module in (elastic, urr):
+        digest.update(Path(module.__file__).read_bytes())
+    try:
+        folder = Path(_march._cache._cache_path)
+        stamp = folder / "subproblem._march.deps"
+        if stamp.exists() and stamp.read_text() == digest.hexdigest():
+            return
+        for path in folder.glob("subproblem._march-*"):
+            path.unlink()
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(digest.hexdigest())
+    except (AttributeError, OSError):
+        pass  # no cache to keep (read-only install or another Numba): it compiles each run
+
+
+_forget_stale_march()
+
+
 @njit
 def _lagged_source(d_scatter, lagged, starts, first, last, values, n_coarse):
     out = np.zeros(n_coarse)
     for t in range(lagged.shape[0]):
         for j in range(n_coarse):
             change = d_scatter[t] * lagged[t, j]
+            if change == 0.0:
+                continue  # block marches lag nothing above the block
             for c in range(first[t, j], last[t, j]):
                 out[c] += change * values[starts[t, j] + c - first[t, j]]
     return out

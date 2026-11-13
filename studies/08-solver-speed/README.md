@@ -188,3 +188,42 @@ On study 03's mixes at 1% (code at this commit; "exact" is the default path afte
   the solve is the thermal block's GMRES marches.
 - **Not yet run with the form:** probability tables (study 05's 64-band case) and orders above
   zero.
+
+## Part 3: the thermal block and the march's fixed costs
+
+On the PWR with the Legendre form, the fixed-source solve was 48.5 s: 5 sweeps of a 2.6 s march
+and 44 marches of the thermal block at 0.7 s each. Profiled per march (PWR at 1%, 173k nodes,
+of which 30k are in the block):
+
+- **Anisotropy in block marches (exact).** A term whose anisotropy bottom lies above a march's
+  start node skips anisotropy there, since F is zero on every panel its windows take.
+- **Lagged source (exact).** `_lagged_source` skips hats with no lagged emission, which in a block
+  march is every hat above the block.
+- **Light targets (H1) take the Legendre form below their bottom node.** This is not exact, but it
+  stays inside the Legendre budget.
+
+Together they took a full march from 2.58 s to 1.51 s, and a block march from 0.70 s to 0.24 s.
+
+- **H1's exact anisotropy was 1.1 s of the 2.6 s march.** Below its bottom (1.1 MeV), every
+  window runs from the bottom to its edge.
+  - Moments summed once from the grid's top, with v = E_bottom / E', serve every node there.
+  - The cosine is x = (c E / E_bottom) v + d, with |ρ v| + |τ| under 3, however light the target.
+  - With linear tables this matches the exact form to round-off (tested).
+- **The block's GMRES stopped at 1e-10 of its right-hand side in every sweep.** But the next sweep
+  changes that right-hand side anyway.
+
+| `BLOCK_RTOL` | Fixed-source solve | Sweeps | Block marches | Flux vs 1e-10 |
+| --- | --- | --- | --- | --- |
+| 1e-10 | 24.4 s | 5 | 44 | |
+| 1e-4 (now) | 19.1 s | 5 | 32 | 7e-15 |
+| 1e-3 | 18.1 s | 5 | 28 | 1e-12 |
+| 1e-2 | 16.5 s | 5 | 24 | 3e-11 |
+| 1e-1 | 30.6 s | 10 | 38 | 3e-11 |
+
+- **The exact path took 72 s, against 90 s before these changes,** and matches the baseline to
+  4.5e-14.
+- **`_march` is now cached:** its first call in a process takes 0.3 s instead of 29 s.
+  - Numba's cache notices only changes to subproblem.py, so `_forget_stale_march` hashes
+    elastic.py and urr.py, whose kernels it inlines or calls.
+  - When the hash changes, it deletes the cached code; a test edit forced the recompile as it
+    should.
