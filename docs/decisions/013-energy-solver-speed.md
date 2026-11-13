@@ -87,3 +87,14 @@ gitignored):
   - Orders stop at 10.
   - The actinides' forward peaks would keep the exact form above 3 to 5 MeV at any tolerance under
     1, so "everywhere" is what makes it fast.
+
+**Deferred, all exact.** Study 08 left these, and Phase 2 can take them up if they come to matter:
+
+- **Inelastic rows keyed by the coarse grid.** The rows depend only on the coarse grid, which a
+  change of `rtol` or `subdivide` keeps. Today's cache key hashes the fine grid, so such a change
+  rebuilds them.
+- **The march's inelastic part.** It is 0.8 s of a 4 s SFR march, and has not been profiled.
+- **Block-march setup.** About 0.1 s of each PWR block march goes to setup that is still
+  unaccounted for: 4 s over a fixed-source solve.
+- **Krylov over all lagged sweeps.** It was judged not worth it, because order-0 solves converge
+  in 4 to 6 sweeps. It might still help orders above zero (14 to 17 sweeps in study 06).

@@ -1,6 +1,7 @@
 # Study 08: where the energy solver's time goes, and what exact changes recover
 
-Status: done for the energy march (Phase 1.5, the speed work after decision 012).
+Status: done (Phase 1.5, the speed work after decision 012). The decision is
+[013](../../docs/decisions/013-energy-solver-speed.md); the gate reruns' logs are in `results/`.
 
 ## Question
 
@@ -186,7 +187,8 @@ On study 03's mixes at 1% (code at this commit; "exact" is the default path afte
   over its 4 sweeps. Of a 4.0 s march, anisotropy is now 2.1 s, and the isotropic recursion (1.2)
   and inelastic transfer (0.8) the rest, so no single part closes the gap. For the PWR, most of
   the solve is the thermal block's GMRES marches.
-- **Not yet run with the form:** probability tables (study 05's 64-band case) and orders above
+- **Not yet run with the form (at the time of part 2):** probability tables (study 05's 64-band
+  case; since rerun, decision 013) and orders above
   zero.
 
 ## Part 3: the thermal block and the march's fixed costs
