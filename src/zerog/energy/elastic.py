@@ -39,6 +39,7 @@ _GAUSS3_W = (5.0 / 18.0, 8.0 / 18.0, 5.0 / 18.0)
 PIECES_PER_PEAK = 8  # quadrature pieces per window, per unit of the local peak of f
 WIDE_WINDOW = 40.0  # stands in for an infinite window, when alpha is zero
 PEAK_RESOLUTION = 0.05  # largest panel, as a fraction of the window over the local peak of f
+CUT_PIECE = 0.01  # cut_moments' largest Gauss piece in lethargy: 0.05 left 2e-11 of the moments
 
 
 @dataclass(frozen=True)
@@ -449,6 +450,47 @@ def _node_value(m0, m1, m2, inverse, e_r, ct, d, mix_a, mix_b):
     return (k0 * m0 + k1 * m1 + k2 * m2) * inverse
 
 
+@njit(inline="always")
+def _tree_range(tree, size, energy, low, high, ct, d, mix_a, mix_b):
+    """Sum of _node_value over panels low:high, through the fewest tree nodes covering them.
+    Inlined, so passing the arrays costs no reference counting."""
+    total = 0.0
+    v_low = low + size
+    v_high = high + size
+    h = 0
+    while v_low < v_high:
+        if v_low & 1:
+            total += _node_value(
+                tree[v_low, 0],
+                tree[v_low, 1],
+                tree[v_low, 2],
+                tree[v_low, 3],
+                energy[(v_low << h) - size],
+                ct,
+                d,
+                mix_a,
+                mix_b,
+            )
+            v_low += 1
+        if v_high & 1:
+            v_high -= 1
+            total += _node_value(
+                tree[v_high, 0],
+                tree[v_high, 1],
+                tree[v_high, 2],
+                tree[v_high, 3],
+                energy[(v_high << h) - size],
+                ct,
+                d,
+                mix_a,
+                mix_b,
+            )
+        v_low >>= 1
+        v_high >>= 1
+        h += 1
+    return total
+
+
 @njit(cache=True)
 def _exp_minus(s):
     """exp(-s), by its series for the small offsets inside panels, exact there to round-off."""
@@ -509,6 +551,39 @@ def _piece_quadrature(
 
 
 @njit(cache=True)
+def cut_moments(upper, lower, h, sigma0, sigma1, flux0, flux1, c):
+    """Centred moments of sigma F (upper / E' - 1)^n du, n = 0, 1, 2, over the top c in lethargy
+    of a panel of width h, as moment_tree_add's leaves hold them for the whole panel.
+
+    sigma is linear in E' and F in u. Three Gauss points per CUT_PIECE of lethargy reach
+    round-off; the leaf less this top must, since it carries no quadrature of its own. z - 1 is
+    taken as expm1 so small offsets keep their relative accuracy.
+    """
+    m0 = 0.0
+    m1 = 0.0
+    m2 = 0.0
+    scale = upper / (upper - lower)
+    width = 1.0 / h
+    pieces = 1 + int(c / CUT_PIECE)
+    step = c / pieces
+    for p in range(pieces):
+        for q in range(3):
+            s = (p + _GAUSS3_X[q]) * step
+            zm1 = math.expm1(s)
+            g = zm1 / (1.0 + zm1) * scale  # (upper - E') / (upper - lower)
+            v = (
+                _GAUSS3_W[q]
+                * step
+                * ((1.0 - g) * sigma0 + g * sigma1)
+                * (flux0 + (flux1 - flux0) * (s * width))
+            )
+            m0 += v
+            m1 += v * zm1
+            m2 += v * zm1 * zm1
+    return m0, m1, m2
+
+
+@njit(cache=True)
 def separable_correction(
     energy,
     k,
@@ -526,6 +601,7 @@ def separable_correction(
     points,
     mu,
     pdf,
+    shared,
 ):
     """anisotropic_correction's (known, own) by the separable form, exactly for the interpolants.
 
@@ -537,6 +613,11 @@ def separable_correction(
     Each segment's whole panels above node k - 1 come from the tree. Partial panels at either end,
     and panel k - 1, whose lower node is the unknown, take quadrature. Searches and table lookups
     are written out here, since a call passing arrays costs reference counting per segment.
+
+    If shared, a knot inside a panel above k - 1 costs one quadrature, not two: the cut's top
+    takes cut_moments, and the segment below takes the panel's leaf less that top, both centred at
+    the panel's top energy and summed through _node_value with each segment's own f. Otherwise
+    each side takes _piece_quadrature of f, the oracle (anisotropy "tree").
     """
     target = energy[k]
     n = energy.shape[0]
@@ -552,6 +633,11 @@ def separable_correction(
     # The segment's top lies in panel i, first_u below its top.
     i = min(_last_at_or_above(energy, start, high_e), k - 1)
     first_u = math.log(energy[i] / high_e) if high_e < energy[i] else 0.0
+    # cut_moments of panel i's top first_u, when the last piece left them there (carry == i).
+    carry = -1
+    c0 = 0.0
+    c1 = 0.0
+    c2 = 0.0
     # Table intervals from the top of the window down: j is the table above, j + 1 below.
     first = tables[t]
     last = tables[t + 1] - 1
@@ -659,6 +745,83 @@ def separable_correction(
                             )
                             known += part
                             own += part_own
+                            carry = -1
+                        elif shared:
+                            whole = i
+                            if first_u > 0.0:
+                                # Panel i below first_u: its leaf less its top, about energy[i].
+                                if carry != i:
+                                    c0, c1, c2 = cut_moments(
+                                        energy[i],
+                                        energy[i + 1],
+                                        widths[i],
+                                        sigma[i],
+                                        sigma[i + 1],
+                                        flux[i],
+                                        flux[i + 1],
+                                        first_u,
+                                    )
+                                v = size + i
+                                known += _node_value(
+                                    tree[v, 0] - c0,
+                                    tree[v, 1] - c1,
+                                    tree[v, 2] - c2,
+                                    tree[v, 3],
+                                    energy[i],
+                                    ct,
+                                    d,
+                                    mix_a,
+                                    mix_b,
+                                )
+                                whole = i + 1
+                            carry = -1
+                            if last_u > 0.0:
+                                if lower + 1 == k:
+                                    # Panel k - 1 holds the unknown and has no leaf yet.
+                                    part, part_own = _piece_quadrature(
+                                        energy[lower],
+                                        energy[lower + 1],
+                                        widths[lower],
+                                        sigma[lower],
+                                        sigma[lower + 1],
+                                        flux[lower],
+                                        flux[lower + 1],
+                                        True,
+                                        0.0,
+                                        last_u,
+                                        ct,
+                                        d,
+                                        mix_a,
+                                        mix_b,
+                                    )
+                                    known += part
+                                    own += part_own
+                                else:
+                                    c0, c1, c2 = cut_moments(
+                                        energy[lower],
+                                        energy[lower + 1],
+                                        widths[lower],
+                                        sigma[lower],
+                                        sigma[lower + 1],
+                                        flux[lower],
+                                        flux[lower + 1],
+                                        last_u,
+                                    )
+                                    carry = lower
+                                    known += _node_value(
+                                        c0,
+                                        c1,
+                                        c2,
+                                        tree[size + lower, 3],
+                                        energy[lower],
+                                        ct,
+                                        d,
+                                        mix_a,
+                                        mix_b,
+                                    )
+                            known += _tree_range(
+                                tree, size, energy, whole, lower, ct, d, mix_a, mix_b
+                            )
                         else:
                             whole = i
                             if first_u > 0.0:

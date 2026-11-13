@@ -332,6 +332,32 @@ def test_transfer_rows_match_depositing_each_reactions_segments(name, bottom):
 
 
 @needs_library
+def test_shared_pool_builds_the_same_kernels_as_one_term_at_a_time():
+    # build_inelastic deals every term's hats into one pool; no bit may depend on that.
+    from zerog.energy.inelastic import build_inelastic, coarse_grid, term_transfer
+    from zerog.energy.terms import _thresholds, awr
+
+    names = ["U238", "O16", "Na23"]
+    pairs = [(n, "294K") for n in names]
+    fine = np.geomspace(14.0e6, 4.0e6, 101)
+    coarse = coarse_grid(fine, 0.02, _thresholds(pairs, 14.0e6, 4.0e6))
+    energy = np.unique(np.concatenate([fine, coarse]))[::-1]
+    terms = [(n, "294K", awr(n)) for n in names]
+    shared = build_inelastic([terms[0], None, *terms[1:]], energy, coarse, 0.005, 8, workers=3)
+    for t, name in zip([0, 2, 3], names, strict=True):
+        rows, lost, _, _ = term_transfer(name, "294K", awr(name), coarse, 0.005, 8, workers=1)
+        a = shared.starts[t, 0]
+        stored = shared.values[a : a + rows.values.shape[0]]
+        np.testing.assert_array_equal(shared.starts[t] - a, rows.starts)
+        np.testing.assert_array_equal(shared.first[t], rows.first)
+        np.testing.assert_array_equal(shared.last[t], rows.last)
+        np.testing.assert_array_equal(stored, rows.values)
+        np.testing.assert_array_equal(shared.lost[t], lost)
+    assert not shared.first[1].any()
+    assert not shared.last[1].any()
+
+
+@needs_library
 def test_kernels_from_another_grid_are_refused():
     from dataclasses import replace
 

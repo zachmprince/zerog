@@ -37,6 +37,7 @@ from scipy.special import erf, erfc, erfcx
 
 from zerog.energy.inelastic import (
     SparseRows,
+    _assemble_rows,
     _start_method,
     _worker_count,
     deposit,
@@ -382,14 +383,18 @@ def _thermal_rows(term, coarse, du, hats):
     return first, last, values, lost
 
 
+def _thermal_hats(term, coarse):
+    n = coarse.shape[0]
+    top = max(term.free_top, term.sab_top)
+    # Hat j spans down to coarse[j + 1], so it emits if that is below the top.
+    return np.nonzero(coarse[np.minimum(np.arange(n) + 1, n - 1)] < top)[0]
+
+
 def thermal_transfer(term, coarse, du=None, workers=None):
     """One term's thermal rows on a coarse grid as SparseRows, and the part of each landing off
     the grid. Hats are split over processes as in inelastic.term_transfer."""
     du = point_spacing(coarse) if du is None else du
-    n = coarse.shape[0]
-    top = max(term.free_top, term.sab_top)
-    # Hat j spans down to coarse[j + 1], so it emits if that is below the top.
-    hats = np.nonzero(coarse[np.minimum(np.arange(n) + 1, n - 1)] < top)[0]
+    hats = _thermal_hats(term, coarse)
     # _worker_count gives one process per 256 of what it is passed.
     count = _worker_count(workers, hats.shape[0] * 256 // HATS_PER_WORKER)
     if count == 1:
@@ -403,26 +408,52 @@ def thermal_transfer(term, coarse, du=None, workers=None):
         with ProcessPoolExecutor(count, mp_context=context) as pool:
             futures = [pool.submit(_thermal_rows, term, coarse, du, s) for s in shares]
             results = [(s, f.result()) for s, f in zip(shares, futures, strict=True)]
-    first = np.zeros(n, dtype=np.int64)
-    last = np.zeros(n, dtype=np.int64)
-    lost = np.zeros(n)
-    pieces = [None] * n
-    for share, (a, b, v, off) in results:
-        first[share] = a
-        last[share] = b
-        lost[share] = off
-        for j, values in zip(share, v, strict=True):
-            pieces[j] = values
-    starts = np.zeros(n, dtype=np.int64)
-    offset = 0
-    flat = []
-    for j in range(n):
-        starts[j] = offset
-        if pieces[j] is not None and pieces[j].shape[0] > 0:
-            flat.append(pieces[j])
-            offset += pieces[j].shape[0]
-    values = np.concatenate(flat) if flat else np.empty(0)
-    return SparseRows(starts, first, last, values), lost
+    return _assemble_rows(coarse.shape[0], results)
+
+
+# Read by forked workers of _thermal_transfers, which sets it before forking: (terms, coarse, du).
+_SHARED = None
+SHARE_HATS = 16  # hats per task in _thermal_transfers' shared pool
+
+
+def _shared_task(t, hats):
+    terms, coarse, du = _SHARED
+    return _thermal_rows(terms[t], coarse, du, hats)
+
+
+def _thermal_transfers(terms, coarse, du=None, workers=None):
+    """thermal_transfer for each term (None for none), with one pool over all their hats, dealt
+    in small interleaved shares: S(alpha, beta) rows cost twenty times free gas ones. Rows don't
+    depend on the split."""
+    global _SHARED
+    du = point_spacing(coarse) if du is None else du
+    present = [t for t, term in enumerate(terms) if term is not None]
+    hats = {t: _thermal_hats(terms[t], coarse) for t in present}
+    count = _worker_count(workers, sum(h.shape[0] for h in hats.values()) * 256 // HATS_PER_WORKER)
+    if count == 1 or _start_method(workers) != "fork":
+        return [
+            None if term is None else thermal_transfer(term, coarse, du, workers) for term in terms
+        ]
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    tasks = []
+    for t in present:
+        shares = max(1, hats[t].shape[0] // SHARE_HATS)
+        tasks.extend((t, hats[t][w::shares]) for w in range(shares))
+    _SHARED = (terms, coarse, du)
+    try:
+        with ProcessPoolExecutor(count, mp_context=multiprocessing.get_context("fork")) as pool:
+            futures = [pool.submit(_shared_task, t, share) for t, share in tasks]
+            results = {t: [] for t in present}
+            for (t, share), future in zip(tasks, futures, strict=True):
+                results[t].append((share, future.result()))
+    finally:
+        _SHARED = None
+    return [
+        None if term is None else _assemble_rows(coarse.shape[0], results[t])
+        for t, term in enumerate(terms)
+    ]
 
 
 # Coarse hats below the thermal tops. Free gas kernels are narrowest for the heaviest target near
@@ -508,7 +539,7 @@ def build_thermal(terms, energy, kernels, du=None, cache=None, workers=None):
                     for t in range(len(terms))
                 ]
         else:
-            rows = [None if t is None else thermal_transfer(t, coarse, du, workers) for t in terms]
+            rows = _thermal_transfers(terms, coarse, du, workers)
             arrays = {}
             for t, item in enumerate(rows):
                 if item is None:
@@ -520,7 +551,7 @@ def build_thermal(terms, energy, kernels, du=None, cache=None, workers=None):
             path.parent.mkdir(parents=True, exist_ok=True)
             np.savez(path, **arrays)
     else:
-        rows = [None if t is None else thermal_transfer(t, coarse, du, workers) for t in terms]
+        rows = _thermal_transfers(terms, coarse, du, workers)
 
     n_terms, n = kernels.first.shape
     if len(terms) != n_terms:

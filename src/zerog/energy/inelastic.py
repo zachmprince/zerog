@@ -1452,11 +1452,17 @@ class SparseRows:
 
 # Above this many emitting hats per worker, build_inelastic spreads hats over processes.
 HATS_PER_WORKER = 256
+SHARE_HATS = 32  # hats per task in build_inelastic's shared pool
 
 
 def _hat_rows(laws, awr, coarse, du, n_cosine, hats, integrals, centroids, totals):
     """Rows of the given hats, as (first, last, values per hat, lost). One process's share."""
     reactions = [_prepare_reaction(r, n_cosine) for r in laws]
+    return _prepared_hat_rows(reactions, awr, coarse, du, hats, integrals, centroids, totals)
+
+
+def _prepared_hat_rows(reactions, awr, coarse, du, hats, integrals, centroids, totals):
+    """_hat_rows with its reactions prepared."""
     n = coarse.shape[0]
     top = coarse[0]
     grid_u = np.log(top / coarse)
@@ -1512,39 +1518,41 @@ def _worker_count(workers, emitting):
     return max(1, min(os.cpu_count() or 1, emitting // HATS_PER_WORKER))
 
 
-def term_transfer(name, temperature, awr, coarse, du=None, n_cosine=COSINE_POINTS, workers=None):
-    """One term's rows on a coarse grid as SparseRows, the part of each hat landing off the grid,
-    and its emission curve as (energies, values) for lin-lin.
+@dataclass(frozen=True)
+class _TermInputs:
+    """What one term's rows are built from: its laws, and each reaction's hat integrals."""
 
-    Row j mixes reactions by their hat-integrated yield * cross section, each evaluated at its
-    centroid in the hat. So every hat that emits has a full row, even one whose node lies below a
-    threshold, and reaction shares are held fixed across a hat: an O(du) approximation.
+    laws: list
+    awr: float
+    integrals: np.ndarray  # (reactions, hats) of yield * cross section
+    centroids: np.ndarray
+    totals: np.ndarray
+    hats: np.ndarray  # the hats that emit
+    table_energy: np.ndarray
+    emission: np.ndarray
 
-    Hats are independent, so workers processes (by default one per HATS_PER_WORKER emitting hats,
-    up to the CPU count) each take every workers-th hat. Each row is the same however they split.
-    """
+
+def _term_inputs(name, temperature, awr, coarse):
     from zerog.data.neutron import read_reactions, read_scattering_yields
     from zerog.data.scatter import read_scattering_laws
 
-    du = point_spacing(coarse) if du is None else du
     n = coarse.shape[0]
     curves = read_reactions(name, temperature)
     laws = [r for r in read_scattering_laws(name) if r.mt != 2]
-    lost = np.zeros(n)
-    first = np.zeros(n, dtype=np.int64)
-    last = np.zeros(n, dtype=np.int64)
-    starts = np.zeros(n, dtype=np.int64)
     mts = np.array([law.mt for law in laws], dtype=np.int64)
     if mts.shape[0] == 0:
-        return (
-            SparseRows(starts, first, last, np.empty(0)),
-            lost,
+        return _TermInputs(
+            laws,
+            awr,
+            np.zeros((0, n)),
+            np.zeros((0, n)),
+            np.zeros(n),
+            np.empty(0, dtype=np.int64),
             curves.energy,
             np.zeros(curves.energy.shape[0]),
         )
     index = np.array([list(curves.mt).index(mt) for mt in mts])
     produced = curves.xs[index] * read_scattering_yields(name, mts, curves.energy)
-    emission = produced.sum(axis=0)
     integrals = np.empty((len(laws), n))
     centroids = np.empty((len(laws), n))
     for r, curve in enumerate(produced):
@@ -1553,21 +1561,17 @@ def term_transfer(name, temperature, awr, coarse, du=None, n_cosine=COSINE_POINT
     for r in range(len(laws)):
         totals += integrals[r]
     hats = np.nonzero(totals > 0.0)[0]
-    count = _worker_count(workers, hats.shape[0])
-    arguments = (laws, awr, coarse, du, n_cosine)
-    tables = (integrals, centroids, totals)
-    if count == 1:
-        results = [(hats, _hat_rows(*arguments, hats, *tables))]
-    else:
-        import multiprocessing
-        from concurrent.futures import ProcessPoolExecutor
+    return _TermInputs(
+        laws, awr, integrals, centroids, totals, hats, curves.energy, produced.sum(axis=0)
+    )
 
-        # Costs vary smoothly with energy, so interleaved shares balance.
-        shares = [hats[w::count] for w in range(count)]
-        context = multiprocessing.get_context(_start_method(workers))
-        with ProcessPoolExecutor(count, mp_context=context) as pool:
-            futures = [pool.submit(_hat_rows, *arguments, share, *tables) for share in shares]
-            results = [(share, f.result()) for share, f in zip(shares, futures, strict=True)]
+
+def _assemble_rows(n, results):
+    """SparseRows and lost from (hats, (first, last, values, lost)) shares covering a term."""
+    lost = np.zeros(n)
+    first = np.zeros(n, dtype=np.int64)
+    last = np.zeros(n, dtype=np.int64)
+    starts = np.zeros(n, dtype=np.int64)
     pieces = [None] * n
     for share, (a, b, v, off) in results:
         first[share] = a
@@ -1583,7 +1587,121 @@ def term_transfer(name, temperature, awr, coarse, du=None, n_cosine=COSINE_POINT
             values.append(pieces[j])
             offset += pieces[j].shape[0]
     flat = np.concatenate(values) if values else np.empty(0)
-    return SparseRows(starts, first, last, flat), lost, curves.energy, emission
+    return SparseRows(starts, first, last, flat), lost
+
+
+# Read by forked workers of _build_rows, which set it before forking: (inputs per term, coarse, du,
+# n_cosine). Each worker prepares a term's reactions once, in _PREPARED.
+_SHARED = None
+_PREPARED = {}
+
+
+def _shared_task(t, hats):
+    inputs, coarse, du, n_cosine = _SHARED
+    term = inputs[t]
+    if t not in _PREPARED:
+        _PREPARED[t] = [_prepare_reaction(r, n_cosine) for r in term.laws]
+    return _prepared_hat_rows(
+        _PREPARED[t], term.awr, coarse, du, hats, term.integrals, term.centroids, term.totals
+    )
+
+
+def _build_rows(inputs, coarse, du, n_cosine, workers):
+    """Rows of every term, as a list of (SparseRows, lost), with one pool over all their hats.
+
+    Hats are independent and their costs vary by orders of magnitude between nuclides (O16 has a
+    tenth of U238's emitting hats and as much work), so every term's hats are dealt into many
+    small interleaved shares that the pool's processes take as they free up. A row's bits do not
+    depend on the split.
+    """
+    global _SHARED
+    n = coarse.shape[0]
+    emitting = sum(term.hats.shape[0] for term in inputs)
+    count = _worker_count(workers, emitting)
+    if count == 1:
+        results = [
+            [
+                (
+                    term.hats,
+                    _hat_rows(
+                        term.laws,
+                        term.awr,
+                        coarse,
+                        du,
+                        n_cosine,
+                        term.hats,
+                        term.integrals,
+                        term.centroids,
+                        term.totals,
+                    ),
+                )
+            ]
+            for term in inputs
+        ]
+        return [_assemble_rows(n, r) for r in results]
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    tasks = []
+    for t, term in enumerate(inputs):
+        # Shares of about SHARE_HATS hats, interleaved since costs vary smoothly with energy.
+        shares = max(1, term.hats.shape[0] // SHARE_HATS)
+        tasks.extend((t, term.hats[w::shares]) for w in range(shares))
+    # Large terms first, so the last tasks to finish are short.
+    tasks.sort(key=lambda task: -inputs[task[0]].hats.shape[0])
+    if _start_method(workers) != "fork":
+        # Spawned workers can't read _SHARED: fall back to one term at a time.
+        return [_term_rows_pool(term, coarse, du, n_cosine, workers) for term in inputs]
+    # Workers fork from here, so they start with no prepared reactions of an earlier build.
+    # Neither global is safe for two builds at once in one process; builds never overlap.
+    _PREPARED.clear()
+    _SHARED = (inputs, coarse, du, n_cosine)
+    try:
+        context = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(count, mp_context=context) as pool:
+            futures = [pool.submit(_shared_task, t, hats) for t, hats in tasks]
+            results = [[] for _ in inputs]
+            for (t, hats), future in zip(tasks, futures, strict=True):
+                results[t].append((hats, future.result()))
+    finally:
+        _SHARED = None
+    return [_assemble_rows(n, r) for r in results]
+
+
+def _term_rows_pool(term, coarse, du, n_cosine, workers):
+    """One term's rows, its hats split over a pool of their own (term_transfer's split)."""
+    count = _worker_count(workers, term.hats.shape[0])
+    arguments = (term.laws, term.awr, coarse, du, n_cosine)
+    tables = (term.integrals, term.centroids, term.totals)
+    if count == 1:
+        results = [(term.hats, _hat_rows(*arguments, term.hats, *tables))]
+    else:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+
+        shares = [term.hats[w::count] for w in range(count)]
+        context = multiprocessing.get_context(_start_method(workers))
+        with ProcessPoolExecutor(count, mp_context=context) as pool:
+            futures = [pool.submit(_hat_rows, *arguments, share, *tables) for share in shares]
+            results = [(share, f.result()) for share, f in zip(shares, futures, strict=True)]
+    return _assemble_rows(coarse.shape[0], results)
+
+
+def term_transfer(name, temperature, awr, coarse, du=None, n_cosine=COSINE_POINTS, workers=None):
+    """One term's rows on a coarse grid as SparseRows, the part of each hat landing off the grid,
+    and its emission curve as (energies, values) for lin-lin.
+
+    Row j mixes reactions by their hat-integrated yield * cross section, each evaluated at its
+    centroid in the hat. So every hat that emits has a full row, even one whose node lies below a
+    threshold, and reaction shares are held fixed across a hat: an O(du) approximation.
+
+    Hats are independent, so workers processes (by default one per HATS_PER_WORKER emitting hats,
+    up to the CPU count) each take every workers-th hat. Each row is the same however they split.
+    """
+    du = point_spacing(coarse) if du is None else du
+    term = _term_inputs(name, temperature, awr, coarse)
+    rows, lost = _term_rows_pool(term, coarse, du, n_cosine, workers)
+    return rows, lost, term.table_energy, term.emission
 
 
 def _cache_key(terms, energy, coarse, du, n_cosine):
@@ -1615,7 +1733,8 @@ def build_inelastic(
 
     coarse must be a subset of energy and span it. With cache, a directory, kernels are stored
     there and reused by any later call with the same grid, terms, settings, data files and code.
-    workers is passed to term_transfer, and doesn't change the kernels.
+    Every term's hats share one pool of workers processes (by default one per HATS_PER_WORKER
+    emitting hats, up to the CPU count), which doesn't change the kernels.
     """
     if cache is not None:
         from pathlib import Path
@@ -1642,14 +1761,17 @@ def build_inelastic(
     lost = np.zeros((n_terms, n))
     values = []
     offset = 0
+    du = point_spacing(coarse) if du is None else du
+    present = [t for t, term in enumerate(terms) if term is not None]
+    inputs = [_term_inputs(terms[t][0], terms[t][1], terms[t][2], coarse) for t in present]
+    built = dict(zip(present, _build_rows(inputs, coarse, du, n_cosine, workers), strict=True))
     for t, term in enumerate(terms):
         if term is None:
             starts[t] = offset
             continue
-        name, label, awr = term
-        rows, lost[t], table_energy, curve = term_transfer(
-            name, label, awr, coarse, du, n_cosine, workers
-        )
+        rows, lost[t] = built[t]
+        term_inputs = inputs[present.index(t)]
+        table_energy, curve = term_inputs.table_energy, term_inputs.emission
         emission[t] = np.interp(energy[::-1], table_energy[::-1], curve[::-1])[::-1]
         starts[t] = rows.starts + offset
         first[t] = rows.first

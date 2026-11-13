@@ -36,6 +36,9 @@ SWEEP_TOLERANCE = 1e-12  # on the hats' emission, relative to the largest
 BLOCK_RESTARTS = 20  # GMRES restart cycles per block solve
 BLOCK_RTOL = 1e-10  # GMRES stop relative to the block's right-hand side
 UPSCATTER_SHARE = 1e-6  # share of a hat's row above its upper neighbour that calls for the block
+# The anisotropic elastic window: the direct sum (the oracle), the moment tree with quadrature of f
+# on every cut panel (decision 008), and the tree with each knot's cut shared between its segments.
+ANISOTROPY_MODES = {"direct": 0, "tree": 1, "separable": 2}
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,10 @@ class EnergySolution:
     # Per banded term (ops.urr.terms), its self-shielded (total, elastic, capture, fission) at every
     # node, the smooth cross sections where no tables apply; capture is absorption less fission.
     shield: np.ndarray | None = None
+    # False if max_sweeps ran out first. emission is the lagged hat emission the next sweep would
+    # take, (terms, coarse nodes) of the operators solved, to start a later solve from.
+    converged: bool = True
+    emission: np.ndarray | None = None
 
 
 def build_operators(
@@ -223,7 +230,45 @@ def _extended_operators(energy, removal, scatter, alpha, angle, kernels, bands, 
 
 @njit(cache=True, error_model="numpy")
 def _edge_integral(energy, sigma, flux, running, j, edge):
-    """The running integral of sigma F / E du at an energy edge inside panel j."""
+    """The running integral of sigma F / E du at an energy edge inside panel j.
+
+    On the piece from energy[j] down to the edge, v in lethargy below its top and s its width,
+    sigma = sigma_j + (sigma_edge - sigma_j) (1 - e^-v) / (1 - e^-s), since it is linear in E, and
+    F = F_j + (F_edge - F_j) v / s. So the piece's integral is exact in closed form:
+    [sigma_j (F_j I + dF P) + (sigma_edge - sigma_j) (F_j J0 + dF J1) / (1 - e^-s)] / energy[j],
+    with I = expm1(s), P = int v e^v / s, J0 = int (e^v - 1) and J1 = int v (e^v - 1) / s over
+    0 < v < s. Below s = 0.1 these take their series, which cancel nothing.
+    """
+    upper = energy[j]
+    lower = energy[j + 1]
+    g = (edge - lower) / (upper - lower)
+    sigma_edge = g * sigma[j] + (1.0 - g) * sigma[j + 1]
+    h = np.log(upper / lower)
+    s = np.log(upper / edge)
+    flux_edge = flux[j] + (flux[j + 1] - flux[j]) * (s / h)
+    df = flux_edge - flux[j]
+    i0 = np.expm1(s)
+    if s < 0.1:
+        term = 1.0  # s^(m - 1) / m!
+        j0 = 0.0
+        j1 = 0.0
+        for m in range(2, 12):
+            term *= s / m
+            j0 += term * s
+            if m >= 3:
+                j1 += (m - 1) * term
+        p = j1 + 0.5 * s
+    else:
+        p = (s * (i0 + 1.0) - i0) / s
+        j0 = i0 - s
+        j1 = p - 0.5 * s
+    shape = (sigma_edge - sigma[j]) * (flux[j] * j0 + df * j1) / -np.expm1(-s) if s > 0.0 else 0.0
+    return running[j] + (sigma[j] * (flux[j] * i0 + df * p) + shape) / upper
+
+
+@njit(cache=True, error_model="numpy")
+def edge_integral_quadrature(energy, sigma, flux, running, j, edge):
+    """_edge_integral by Gauss quadrature, its oracle."""
     upper = energy[j]
     lower = energy[j + 1]
     g = (edge - lower) / (upper - lower)
@@ -284,7 +329,7 @@ def _march(
     values,
     lagged,
     coarse_source,
-    separable,
+    mode,
     moment_weights,
     start,
     u_terms,
@@ -311,8 +356,9 @@ def _march(
     most the current block and the previous one, so the subtraction cancels only local magnitudes
     and F keeps its relative accuracy when it falls faster than E.
 
-    If separable, anisotropic terms keep a tree of centred panel moments, for
-    separable_correction; otherwise they take the direct sum, anisotropic_correction.
+    mode picks the anisotropic window: 0 is the direct sum, anisotropic_correction; above 0,
+    anisotropic terms keep a tree of centred panel moments for separable_correction, which shares
+    each knot's cut panel between its two segments if mode is 2 (ANISOTROPY_MODES).
 
     Every running sum is linear in the F above it, so with F zero above start, marching from start
     with empty sums is the whole march. The block solve uses that for sources that only reach
@@ -329,6 +375,8 @@ def _march(
     """
     n_terms = removal.shape[0]
     n = energy.shape[0]
+    separable = mode > 0
+    shared_cuts = mode == 2
     flux = np.zeros(n)
     diagonal = np.zeros(n)
     running = np.zeros((n_terms, n))
@@ -336,6 +384,16 @@ def _march(
     block_start = np.zeros(n_terms, dtype=np.int64)
     previous_total = np.zeros(n_terms)
     width = np.array([-np.log(a) if a > 0.0 else WIDE_WINDOW for a in alpha])
+    # Terms with no elastic scattering, such as the pseudo-terms of orders above zero, add nothing
+    # to the window recursion, so they skip it (and their running sums stay zero).
+    elastic = np.zeros(n_terms, dtype=np.bool_)
+    for t in range(n_terms):
+        for m in range(n):
+            if scatter[t, m] != 0.0:
+                elastic[t] = True
+                break
+    for j in range(u_terms.shape[0]):
+        elastic[u_terms[j]] = True  # band elastic can be nonzero where the smooth one is not
     restricted = np.zeros(lagged.shape)
     # Anisotropic terms' slots in moments, and the node below which their direct sums stop.
     slot = np.full(n_terms, -1)
@@ -473,7 +531,7 @@ def _march(
                     d_band[c] += d_removal[t] * tot_now[jt, c]
             else:
                 lhs += d_removal[t] * removal[t, k]
-            if k == 0:
+            if k == 0 or not elastic[t]:
                 continue
             sigma = scatter[t]
             w = weights[k - 1]
@@ -524,6 +582,7 @@ def _march(
                     points,
                     mu,
                     pdf,
+                    shared_cuts,
                 )
                 window += extra
                 own += extra_own
@@ -625,6 +684,8 @@ def _march(
                         coarse_source[c] += change * values[row_start + c - first[t, p]]
         if k > 0:
             for t in range(n_terms):
+                if not elastic[t]:
+                    continue
                 sigma = scatter[t]
                 w = weights[k - 1]
                 jt = band_of[t]
@@ -734,7 +795,7 @@ def march(ops, removal, scatter, streaming, source, lagged, start=0, anisotropy=
         kernels.values,
         lagged,
         coarse_source,
-        anisotropy == "separable",
+        ANISOTROPY_MODES[anisotropy],
         ops.moment_weights,
         start,
         ops.urr.terms,
@@ -753,10 +814,20 @@ def march(ops, removal, scatter, streaming, source, lagged, start=0, anisotropy=
     )
 
 
-def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable", initial=None):
+def solve_energy(
+    ops,
+    removal,
+    scatter,
+    streaming,
+    source,
+    anisotropy="separable",
+    initial=None,
+    max_sweeps=None,
+):
     """Solve for F. removal is (terms), scatter is (terms, orders), source is (energies).
 
-    anisotropy is "separable" (elastic.separable_correction) or "direct", the oracle's direct sum.
+    anisotropy is "separable" (elastic.separable_correction), "tree" (the same with quadrature of f
+    on both sides of every cut, decision 008) or "direct", the oracle's direct sum.
     initial is a first guess of the lagged inelastic emission, (terms, coarse nodes) as
     zerog.energy.inelastic.restrict gives it, such as that of a previous flux; zero by default.
 
@@ -766,8 +837,10 @@ def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable
     the block's top as the operator: a march is Gauss-Seidel, so this is GMRES preconditioned by
     the downward sweep. Sweeps end when one reproduces the emission it was given.
     """
-    if anisotropy not in ("separable", "direct"):
-        raise ValueError(f"anisotropy must be 'separable' or 'direct', not {anisotropy!r}")
+    if max_sweeps is not None and int(max_sweeps) < 1:
+        raise ValueError(f"max_sweeps must be at least 1, not {max_sweeps}")
+    if anisotropy not in ANISOTROPY_MODES:
+        raise ValueError(f"anisotropy must be one of {list(ANISOTROPY_MODES)}, not {anisotropy!r}")
     removal = np.asarray(removal, dtype=float)
     scatter = np.asarray(scatter, dtype=float)
     source = np.asarray(source, dtype=float)
@@ -785,10 +858,14 @@ def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable
         d_scatter = padded.T.ravel()[:, None]
         start = None
         if initial is not None:
-            start = np.zeros((d_removal.shape[0], ops.extended.inelastic.coarse.shape[0]))
-            start[:n_terms] = initial
+            initial = np.asarray(initial, dtype=float)
+            if initial.shape[0] == d_removal.shape[0]:
+                start = initial
+            else:
+                start = np.zeros((d_removal.shape[0], ops.extended.inelastic.coarse.shape[0]))
+                start[:n_terms] = initial
         return solve_energy(
-            ops.extended, d_removal, d_scatter, streaming, source, anisotropy, start
+            ops.extended, d_removal, d_scatter, streaming, source, anisotropy, start, max_sweeps
         )
     if removal.shape != (n_terms,) or scatter.shape != (n_terms, 1) or source.shape != (n,):
         raise ValueError(
@@ -808,16 +885,19 @@ def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable
 
     block = upscatter_block(kernels) if kernels.values.shape[0] > 0 else None
     applications = 0
-    for count in range(1, MAX_SWEEPS + 1):
+    limit = MAX_SWEEPS if max_sweeps is None else min(int(max_sweeps), MAX_SWEEPS)
+    for count in range(1, limit + 1):
         flux, diagonal, restricted, shield = sweep(source, lagged, 0)
         scale = np.abs(restricted).max()
         if (
             kernels.values.shape[0] == 0
             or np.abs(restricted - lagged).max() <= SWEEP_TOLERANCE * scale
         ):
-            return EnergySolution(flux, diagonal, count, applications, shield)
+            return EnergySolution(flux, diagonal, count, applications, shield, emission=restricted)
         if block is None:
             lagged = restricted
+            if count == limit and max_sweeps is not None:
+                return EnergySolution(flux, diagonal, count, applications, shield, False, lagged)
             continue
         first_hat, start = block
         zero = np.zeros(n)
@@ -844,4 +924,6 @@ def solve_energy(ops, removal, scatter, streaming, source, anisotropy="separable
         updated = restricted.copy()
         updated[:, first_hat:] = lagged[:, first_hat:] + change.reshape(shape)
         lagged = updated
+        if count == limit and max_sweeps is not None:
+            return EnergySolution(flux, diagonal, count, applications, shield, False, lagged)
     raise RuntimeError(f"inelastic sweeps did not converge in {MAX_SWEEPS}")

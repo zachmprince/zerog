@@ -20,7 +20,12 @@ from zerog.energy.grid import (
     rate_weights,
     square_weights,
 )
-from zerog.energy.subproblem import build_operators, solve_energy
+from zerog.energy.subproblem import (
+    _edge_integral,
+    build_operators,
+    edge_integral_quadrature,
+    solve_energy,
+)
 
 needs_library = pytest.mark.skipif(
     "OPENMC_CROSS_SECTIONS" not in os.environ, reason="OPENMC_CROSS_SECTIONS is not set"
@@ -502,3 +507,36 @@ def test_thinned_grids_hold_their_curves_at_every_library_point(curves):
             tested = d.xs if curves == "all" else major_curves(d)
             for row in tested:
                 check(d.energy, row)
+
+
+@pytest.mark.parametrize("width", [1e-7, 1e-4, 0.02, 0.099, 0.101, 0.6])
+def test_edge_integral_closed_form_matches_quadrature_and_scipy(width):
+    # The closed form against the Gauss oracle and an independent integral, on panels either side
+    # of its series switch, with edges anywhere in them and F crossing zero.
+    rng = np.random.default_rng(3)
+    n = 40
+    energy = 1.0e6 * np.exp(-width * np.arange(n))
+    sigma = rng.uniform(0.2, 5.0, n)
+    flux = rng.uniform(-1.0, 2.0, n)
+    running = rng.uniform(-1.0, 1.0, n)
+    for j in rng.integers(0, n - 1, 25):
+        for share in (0.0, 1e-9, rng.uniform(), 1.0 - 1e-9, 1.0):
+            edge = energy[j + 1] + share * (energy[j] - energy[j + 1])
+            closed = _edge_integral(energy, sigma, flux, running, j, edge)
+            gauss = edge_integral_quadrature(energy, sigma, flux, running, j, edge)
+            h = np.log(energy[j] / energy[j + 1])
+
+            def integrand(v, j=j, h=h):
+                e = energy[j] * np.exp(-v)
+                g = (e - energy[j + 1]) / (energy[j] - energy[j + 1])
+                f = flux[j] + (flux[j + 1] - flux[j]) * v / h
+                return (g * sigma[j] + (1.0 - g) * sigma[j + 1]) * f / e
+
+            s = np.log(energy[j] / edge)
+            exact = running[j] + quad(integrand, 0.0, s, epsabs=0.0, epsrel=1e-13)[0]
+            scale = abs(running[j]) + sigma.max() * np.abs(flux).max() * max(s, 1e-300) / edge
+            assert closed == pytest.approx(exact, rel=1e-13, abs=1e-14 * scale)
+            # Three Gauss points per 0.05 leave about 1e-12 on panels as wide as 0.6.
+            assert closed == pytest.approx(
+                gauss, rel=1e-11 if h > 0.1 else 1e-13, abs=1e-14 * scale
+            )

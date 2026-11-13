@@ -437,3 +437,23 @@ def test_round_off_upward_deposits_do_not_start_the_block():
             }
         )
         assert (upscatter_block(kernels) is not None) == expect
+
+
+def test_shared_pool_builds_the_same_thermal_rows_as_one_term_at_a_time():
+    # build_thermal deals every term's hats into one pool; no bit may depend on that.
+    top = 400.0 * KT
+    fine = np.geomspace(4.0 * top, 1e-3, 600)
+    fine = np.unique(np.concatenate([fine, [top, top * (1.0 - 1e-10)]]))[::-1]
+    coarse = coarse_grid(fine, 0.02)
+    energy = np.unique(np.concatenate([fine, coarse]))[::-1]
+    terms = [
+        ThermalTerm(awr, KT, top, energy, 20.0 * free_gas_norm(energy, awr, KT))
+        for awr in (1.0, 15.86)
+    ]
+    shared = thermal._thermal_transfers([terms[0], None, terms[1]], coarse, workers=3)
+    assert shared[1] is None
+    for t, term in ((0, terms[0]), (2, terms[1])):
+        rows, lost = thermal.thermal_transfer(term, coarse, workers=1)
+        for field in ("starts", "first", "last", "values"):
+            np.testing.assert_array_equal(getattr(shared[t][0], field), getattr(rows, field))
+        np.testing.assert_array_equal(shared[t][1], lost)

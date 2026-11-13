@@ -11,6 +11,7 @@ from zerog.energy.balance import energy_balance
 from zerog.energy.elastic import (
     angle_pdf,
     compile_angle_tables,
+    cut_moments,
     lab_cosine,
     moment_tree_add,
     moment_tree_size,
@@ -255,7 +256,9 @@ def quad_row(energy, sigma, alpha, table, k):
     return row
 
 
-@pytest.mark.parametrize(("anisotropy", "rtol"), [("separable", 1e-10), ("direct", 2e-4)])
+@pytest.mark.parametrize(
+    ("anisotropy", "rtol"), [("separable", 1e-10), ("tree", 1e-10), ("direct", 2e-4)]
+)
 def test_march_matches_quadrature_oracle_with_negative_density(anisotropy, rtol):
     # The separable form is exact for the interpolants; the direct sum is quadrature.
     alpha = kinematic_alpha(11.9)
@@ -274,8 +277,9 @@ def test_march_matches_quadrature_oracle_with_negative_density(anisotropy, rtol)
     np.testing.assert_allclose(flux, np.linalg.solve(a, source), rtol=rtol)
 
 
+@pytest.mark.parametrize("anisotropy", ["separable", "tree"])
 @pytest.mark.parametrize("awr", [11.9, 236.0])
-def test_separable_form_matches_quadrature_with_tables_varying_inside_a_window(awr):
+def test_separable_form_matches_quadrature_with_tables_varying_inside_a_window(awr, anisotropy):
     # Tables on different mu knots, a jump between two at one energy, and the top table held above
     # the data, over three windows. A flat table far below keeps the anisotropy cutoff off the
     # grid, since quad_row has none.
@@ -308,7 +312,7 @@ def test_separable_form_matches_quadrature_with_tables_varying_inside_a_window(a
     ops = build_operators(energy, sigma + 0.2, sigma, [alpha], [table])
     assert ops.angle.cutoff[0] < energy[-1]
     source = np.exp(-np.arange(61) / 8.0)
-    flux = solve_energy(ops, [1.0], [[0.8]], 0.1, source).flux
+    flux = solve_energy(ops, [1.0], [[0.8]], 0.1, source, anisotropy).flux
     a = np.diag(0.1 + ops.removal[0])
     for k in range(1, 61):
         a[k] -= 0.8 * quad_row(energy, sigma[0], alpha, table, k)
@@ -360,6 +364,66 @@ def test_moment_tree_nodes_hold_centred_moments_of_their_panels():
             assert tree[v, power] == pytest.approx(expected, rel=1e-10, abs=1e-14 * abs(tree[v, 0]))
         checked += 1
     assert checked > 50
+
+
+@pytest.mark.parametrize("c", [0.0, 1e-9, 3e-4, 0.7, 1.0])
+def test_cut_moments_are_centred_moments_of_the_panel_top(c):
+    # Over a panel's top c of its width: the integral of sigma F (E_i / E - 1)^n du, n = 0, 1, 2.
+    upper = 2.0e6
+    h = 0.12
+    lower = upper * np.exp(-h)
+    sigma0, sigma1, flux0, flux1 = 1.3, 0.4, -0.7, 2.1
+
+    def integrand(s, power):
+        e = upper * np.exp(-s)
+        g = (upper - e) / (upper - lower)
+        value = ((1 - g) * sigma0 + g * sigma1) * (flux0 + (flux1 - flux0) * s / h)
+        return value * np.expm1(s) ** power
+
+    moments = cut_moments(upper, lower, h, sigma0, sigma1, flux0, flux1, c * h)
+    # The kernel's coefficients times the range of (E_i / E - 1)^n are of one size, so each
+    # moment's error counts against the scale of the zeroth's magnitude.
+    scale = quad(lambda s: abs(integrand(s, 0)), 0.0, max(c * h, 1e-300))[0]
+    for power in range(3):
+        expected = quad(integrand, 0.0, c * h, args=(power,), epsabs=0.0, epsrel=1e-13)[0]
+        assert moments[power] == pytest.approx(expected, rel=1e-12, abs=1e-13 * scale)
+    if c == 1.0:
+        # The whole panel is the tree's leaf.
+        energy = np.array([upper, lower])
+        leaf = centred_weights(energy)[:, 0] @ np.array(
+            [sigma0 * flux0, sigma0 * flux1, sigma1 * flux0, sigma1 * flux1]
+        )
+        np.testing.assert_allclose(moments, leaf, rtol=1e-12, atol=1e-13 * scale)
+
+
+@needs_library
+def test_shared_cuts_match_the_tree_path_with_real_data():
+    # Forward peaks above 1 MeV, tables close in energy (Fe56) and a window to the grid's top (H1):
+    # sharing each knot's cut panel changes only round-off.
+    from zerog.energy.elastic import point_emission
+    from zerog.energy.terms import elastic_grid, load_term
+
+    nuclides = [("U238", "294K"), ("Fe56", "294K"), ("H1", "294K")]
+    top = 2.0e7
+    energy = elastic_grid(nuclides, 1e-3, 1e-8, top, 2.0e5)
+    terms = [load_term(name, label, energy) for name, label in nuclides]
+    ops = build_operators(
+        energy,
+        np.array([t.total for t in terms]),
+        np.array([t.elastic for t in terms]),
+        [t.alpha for t in terms],
+        [t.angle for t in terms],
+    )
+    d = np.array([0.02, 0.03, 0.01])
+    source = sum(
+        density * point_emission(energy, top, t.alpha, t.angle)
+        for density, t in zip(d, terms, strict=True)
+    )
+    flux = {
+        method: solve_energy(ops, d, d[:, None], 0.0, source, method).flux
+        for method in ("separable", "tree")
+    }
+    np.testing.assert_allclose(flux["separable"], flux["tree"], rtol=1e-12)
 
 
 @needs_library

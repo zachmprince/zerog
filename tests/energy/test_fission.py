@@ -209,6 +209,29 @@ def dense_k(apply, n):
 
 
 @needs_library
+def test_one_sweep_per_iteration_reaches_the_fully_solved_fixed_point():
+    # With inelastic sweeps lagged, one sweep per power iteration converges to the same k and flux
+    # as solving each iteration fully, in fewer sweeps.
+    from zerog.energy.eigen import solve_k
+    from zerog.energy.inelastic import build_inelastic
+    from zerog.energy.subproblem import build_operators
+    from zerog.energy.terms import awr
+
+    names = ["U235", "U238"]
+    energy, coarse, fission = fission_case(names, nodes=121, coarse_du=0.05)
+    smooth = np.array([3.0 + 0.1 * np.log(2.0e7 / energy), 6.0 + 0.2 * np.log(2.0e7 / energy)])
+    kernels = build_inelastic([None, ("U238", "294K", awr("U238"))], energy, coarse)
+    ops = build_operators(energy, smooth, 0.5 * smooth, [0.0, 0.0], inelastic=kernels)
+    density = np.array([0.002, 0.02])
+    full = solve_k(ops, fission, density, density[:, None], 0.0, density, sweeps_per_iteration=None)
+    fast = solve_k(ops, fission, density, density[:, None], 0.0, density)
+    assert full.sweeps > full.iterations  # the sweeps are lagged, so there is something to save
+    assert fast.sweeps < full.sweeps
+    assert fast.k == pytest.approx(full.k, rel=1e-9)
+    np.testing.assert_allclose(fast.flux, full.flux, rtol=1e-7)
+
+
+@needs_library
 @pytest.mark.parametrize("scatter", [False, True])
 def test_power_iteration_finds_the_dominant_eigenvalue(scatter):
     # Without scattering, F = source / Sigma_t, so the dense map is explicit. With isotropic elastic
