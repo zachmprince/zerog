@@ -74,6 +74,7 @@ def build_mix(
     bands=0,
     orders=0,
     angle_tolerance=ANGLE_TOLERANCE,
+    legendre=None,
 ):
     """Assemble a mix of {name: atoms/b-cm} at a library temperature label.
 
@@ -85,7 +86,9 @@ def build_mix(
     with that many band combinations (zerog.energy.urr); 0 leaves them off. orders adds elastic
     Legendre orders 1 .. orders (zerog.energy.moments), built one process per nuclide.
     angle_tolerance thins each elastic angle table's cosines (zerog.energy.elastic.thin_angle),
-    the anisotropic correction's main cost; 0 keeps the library's tables.
+    the anisotropic correction's main cost; 0 keeps the library's tables. legendre, (order,
+    tolerance) or None, is passed to build_operators: the truncated Legendre form of the
+    anisotropic windows, an approximation, where each nuclide's tables allow it.
     """
     names = list(densities)
     density = np.array([densities[n] for n in names], dtype=float)
@@ -136,6 +139,7 @@ def build_mix(
         kernels,
         build_urr(nuclides, energy, bands) if bands else None,
         order_rows,
+        legendre,
     )
     return Mix(names, label, density, energy, coarse, top, energy_min, terms, specs, ops, fission)
 

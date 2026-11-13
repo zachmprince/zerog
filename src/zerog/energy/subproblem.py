@@ -17,10 +17,13 @@ import numpy as np
 from numba import njit
 
 from zerog.energy.elastic import (
+    LEGENDRE_MIN_ALPHA,
     WIDE_WINDOW,
     AngleKernels,
     anisotropic_correction,
     compile_angle_tables,
+    legendre_combine,
+    legendre_panel_moments,
     moment_tree_add,
     moment_tree_size,
     separable_correction,
@@ -33,6 +36,9 @@ from zerog.linalg import solve
 
 MAX_SWEEPS = 50
 SWEEP_TOLERANCE = 1e-12  # on the hats' emission, relative to the largest
+# With the Legendre form, round-off in its running moments leaves noise near 1e-12 of F, far
+# below its truncation error, on which the exact tolerance would stall (elastic.LEGENDRE_MAX_ORDER).
+LEGENDRE_SWEEP_TOLERANCE = 1e-10
 BLOCK_RESTARTS = 20  # GMRES restart cycles per block solve
 BLOCK_RTOL = 1e-10  # GMRES stop relative to the block's right-hand side
 UPSCATTER_SHARE = 1e-6  # share of a hat's row above its upper neighbour that calls for the block
@@ -59,6 +65,7 @@ class EnergyOperators:
     node_m: np.ndarray
     node_theta: np.ndarray
     urr: UrrData
+    sweep_tolerance: float = SWEEP_TOLERANCE
     # Orders above zero, as pseudo-terms of a second set of operators (build_operators).
     orders: int = 0
     extended: "EnergyOperators | None" = None
@@ -86,7 +93,15 @@ class EnergySolution:
 
 
 def build_operators(
-    energy, removal, scatter, alpha, angle=None, inelastic=None, urr=None, order_rows=None
+    energy,
+    removal,
+    scatter,
+    alpha,
+    angle=None,
+    inelastic=None,
+    urr=None,
+    order_rows=None,
+    legendre=None,
 ):
     """Check a grid against its terms, and collect the panel weights.
 
@@ -155,7 +170,7 @@ def build_operators(
         if len(order_rows) != alpha.shape[0] or any(len(r) != n_orders for r in order_rows):
             raise ValueError("order_rows must hold the same orders for every term")
         extended = _extended_operators(
-            energy, removal, scatter, alpha, angle, kernels, bands, order_rows
+            energy, removal, scatter, alpha, angle, kernels, bands, order_rows, legendre
         )
     panel_m, panel_share, node_m, node_theta = panel_hats(energy, kernels.coarse)
     rates = rate_weights(energy)
@@ -168,19 +183,24 @@ def build_operators(
         rate_weights=rates,
         emission_weights=emissions,
         moment_weights=centred_weights(energy),
-        angle=compile_angle_tables([None] * alpha.shape[0] if angle is None else angle),
+        angle=compile_angle_tables(
+            [None] * alpha.shape[0] if angle is None else angle, legendre=legendre
+        ),
         inelastic=kernels,
         panel_m=panel_m,
         panel_share=panel_share,
         node_m=node_m,
         node_theta=node_theta,
         urr=bands,
+        sweep_tolerance=SWEEP_TOLERANCE if legendre is None else LEGENDRE_SWEEP_TOLERANCE,
         orders=n_orders,
         extended=extended,
     )
 
 
-def _extended_operators(energy, removal, scatter, alpha, angle, kernels, bands, order_rows):
+def _extended_operators(
+    energy, removal, scatter, alpha, angle, kernels, bands, order_rows, legendre=None
+):
     """Operators over the terms and then each (order, term) pseudo-term, order by order."""
     n_terms, n = removal.shape
     n_orders = len(order_rows[0])
@@ -225,6 +245,7 @@ def _extended_operators(energy, removal, scatter, alpha, angle, kernels, bands, 
         angles + [None] * (n_terms * n_orders),
         merged,
         bands,
+        legendre=legendre,
     )
 
 
@@ -295,6 +316,135 @@ def edge_integral_quadrature(energy, sigma, flux, running, j, edge):
     return running[j] + total
 
 
+@njit(error_model="numpy", inline="always")
+def _legendre_window(
+    energy,
+    widths,
+    k,
+    sigma,
+    flux,
+    alpha,
+    j,
+    reach,
+    current_start,
+    previous_start,
+    current,
+    previous,
+    top_sum,
+    top_block,
+    top_panel,
+    own_a,
+    own_b,
+    stored,
+    legendre_b,
+    low,
+    high,
+    table_energy,
+    binomial,
+    part_a,
+    part_b,
+    upper_sum,
+    span_sum,
+    scratch,
+):
+    """The Legendre form's (known, own) of node k's window, as separable_correction gives them.
+
+    j is the panel holding the window's top edge, energy[k] / alpha, or the grid's top. Panels at
+    and below reach, the term's anisotropy bottom, take none. The window top's running sum
+    advances lazily from the top of the block holding the edge, and restarts when that block
+    changes, from each panel's moments as stored when it was solved (about its block's top).
+    own_a and own_b receive panel k - 1's moments per unit F at its ends, about the current
+    block's top.
+    """
+    order = legendre_b.shape[1] - 1
+    n_moments = current.shape[0]
+    c = 2.0 / (1.0 - alpha)
+    d = -(1.0 + alpha) / (1.0 - alpha)
+    target = energy[k]
+    edge = target / alpha
+    known = 0.0
+    own = 0.0
+    at_top = edge >= energy[0]
+    if not at_top and j >= reach:
+        return known, own
+    if at_top:
+        block = current_start if current_start == 0 else previous_start
+        for q in range(n_moments):
+            upper_sum[q] = 0.0
+    else:
+        block = current_start if j >= current_start else previous_start
+        reference = energy[block]
+        if top_block[0] != block:
+            top_block[0] = block
+            top_panel[0] = block
+            for q in range(n_moments):
+                top_sum[q] = 0.0
+        while top_panel[0] < j:
+            p = top_panel[0]
+            slot = p % stored.shape[0]
+            for q in range(n_moments):
+                top_sum[q] += stored[slot, q]
+            top_panel[0] = p + 1
+        for q in range(n_moments):
+            part_a[q] = 0.0
+            part_b[q] = 0.0
+        legendre_panel_moments(
+            energy,
+            sigma,
+            j,
+            widths[j],
+            energy[j],
+            edge,
+            c * alpha * reference,
+            d,
+            legendre_b,
+            low,
+            high,
+            table_energy,
+            part_a,
+            part_b,
+            scratch,
+        )
+        for q in range(n_moments):
+            upper_sum[q] = top_sum[q] + flux[j] * part_a[q] + flux[j + 1] * part_b[q]
+    rho = target / (alpha * energy[current_start])
+    tau = d * (1.0 - rho)
+    if block == current_start:
+        for q in range(n_moments):
+            span_sum[q] = current[q] - upper_sum[q]
+        known += legendre_combine(span_sum, rho, tau, order, binomial, scratch)
+    else:
+        for q in range(n_moments):
+            span_sum[q] = previous[q] - upper_sum[q]
+        rho_p = target / (alpha * energy[previous_start])
+        known += legendre_combine(span_sum, rho_p, d * (1.0 - rho_p), order, binomial, scratch)
+        known += legendre_combine(current, rho, tau, order, binomial, scratch)
+    if k - 1 < reach:
+        for q in range(n_moments):
+            own_a[q] = 0.0
+            own_b[q] = 0.0
+        legendre_panel_moments(
+            energy,
+            sigma,
+            k - 1,
+            widths[k - 1],
+            energy[k - 1],
+            energy[k],
+            c * alpha * energy[current_start],
+            d,
+            legendre_b,
+            low,
+            high,
+            table_energy,
+            own_a,
+            own_b,
+            scratch,
+        )
+        known += flux[k - 1] * legendre_combine(own_a, rho, tau, order, binomial, scratch)
+        own += legendre_combine(own_b, rho, tau, order, binomial, scratch)
+    return known, own
+
+
 # Not cached: Numba's cache does not notice changes to a callee in another file, so a cached caller
 # would keep running the old kernel.
 @njit(error_model="numpy")
@@ -315,6 +465,8 @@ def _march(
     pdf,
     cutoff,
     peak,
+    legendre_b,
+    legendre_switch,
     rates,
     emission,
     hat,
@@ -399,6 +551,9 @@ def _march(
     slot = np.full(n_terms, -1)
     bottom = np.zeros(n_terms)
     n_slots = 0
+    legendre_slot = np.full(n_terms, -1)
+    legendre_reach = np.zeros(n_terms, dtype=np.int64)
+    n_legendre = 0
     # Panels the moment trees must hold: windows never reach below a term's bottom node.
     tree_panels = 0
     for t in range(n_terms):
@@ -412,7 +567,55 @@ def _march(
             slot[t] = n_slots
             n_slots += 1
             tree_panels = max(tree_panels, reach)
+        if (
+            separable
+            and cutoff[t] < np.inf
+            and alpha[t] >= LEGENDRE_MIN_ALPHA
+            and legendre_switch[t] > 0.0
+        ):
+            legendre_slot[t] = n_legendre
+            legendre_reach[t] = reach
+            n_legendre += 1
     size = moment_tree_size(tree_panels + 1)
+    # The Legendre form's running moments per term (elastic.legendre_panel_moments): the current
+    # block's from its top node down to the last panel solved, the whole previous block's, and the
+    # window top's from the top of the block holding it down to top_panel, all about each block's
+    # top energy. own_a and own_b are panel k - 1's, per unit F there, kept for after the solve.
+    order = legendre_b.shape[1] - 1
+    n_moments = (order + 1) * (order + 2) // 2
+    # Each panel's moments, kept from its solve for the window top's sum, in a ring holding the
+    # previous block's start to the node being solved: two windows and two panels at most.
+    capacity = 4
+    for t in range(n_terms):
+        if legendre_slot[t] < 0:
+            continue
+        far = 0
+        for m in range(n):
+            limit = energy[m] / (alpha[t] * alpha[t])
+            while energy[far] > limit:
+                far += 1
+            capacity = max(capacity, m - far + 4)
+    stored = np.zeros((n_legendre, capacity, n_moments))
+    current = np.zeros((n_legendre, n_moments))
+    previous = np.zeros((n_legendre, n_moments))
+    top_sum = np.zeros((n_legendre, n_moments))
+    own_a = np.zeros((n_legendre, n_moments))
+    own_b = np.zeros((n_legendre, n_moments))
+    own_ready = np.zeros(n_legendre, dtype=np.bool_)
+    current_start = np.zeros(n_legendre, dtype=np.int64)
+    previous_start = np.full(n_legendre, -1, dtype=np.int64)
+    top_block = np.full(n_legendre, -1, dtype=np.int64)
+    top_panel = np.zeros(n_legendre, dtype=np.int64)
+    part_a = np.zeros(n_moments)
+    part_b = np.zeros(n_moments)
+    upper_sum = np.zeros(n_moments)
+    span_sum = np.zeros(n_moments)
+    scratch = np.zeros(6 * (order + 1))
+    binomial = np.zeros((order + 1, order + 1))
+    for a in range(order + 1):
+        binomial[a, 0] = 1.0
+        for b in range(1, a + 1):
+            binomial[a, b] = binomial[a - 1, b - 1] + (binomial[a - 1, b] if b < a else 0.0)
     widths = np.log(energy[:-1] / energy[1:])
     trees = np.zeros((n_slots, 2 * size if n_slots > 0 else 0, 4))
     # Bands: each banded term's index, its band cross sections at this node and the one above, and
@@ -564,7 +767,52 @@ def _march(
                     window += -part if j >= block_start[t] else previous_total[t] - part
                 else:
                     window += previous_total[t]
-            if slot[t] >= 0 and energy[pointer[t]] > cutoff[t]:
+            ls = legendre_slot[t]
+            if ls >= 0 and k > 1 and energy[k - 1] <= alpha[t] * energy[current_start[ls]]:
+                for q in range(n_moments):
+                    previous[ls, q] = current[ls, q]
+                    current[ls, q] = 0.0
+                previous_start[ls] = current_start[ls]
+                current_start[ls] = k - 1
+            if (
+                ls >= 0
+                and energy[k] / alpha[t] <= legendre_switch[t]
+                and energy[pointer[t]] > cutoff[t]
+            ):
+                extra, extra_own = _legendre_window(
+                    energy,
+                    widths,
+                    k,
+                    sigma,
+                    flux,
+                    alpha[t],
+                    pointer[t],
+                    legendre_reach[t],
+                    current_start[ls],
+                    previous_start[ls],
+                    current[ls],
+                    previous[ls],
+                    top_sum[ls],
+                    top_block[ls : ls + 1],
+                    top_panel[ls : ls + 1],
+                    own_a[ls],
+                    own_b[ls],
+                    stored[ls],
+                    legendre_b,
+                    tables[t],
+                    tables[t + 1],
+                    table_energy,
+                    binomial,
+                    part_a,
+                    part_b,
+                    upper_sum,
+                    span_sum,
+                    scratch,
+                )
+                own_ready[ls] = k - 1 < legendre_reach[t]
+                window += extra
+                own += extra_own
+            elif slot[t] >= 0 and energy[pointer[t]] > cutoff[t]:
                 extra, extra_own = separable_correction(
                     energy,
                     k,
@@ -698,10 +946,46 @@ def _march(
                     running[t, k] += (
                         flux[k] * (sigma[k - 1] * w[1] + sigma[k] * w[3]) / energy[k - 1]
                     )
-                if slot[t] >= 0 and k - 1 < tree_panels:
+                # Windows of nodes below alpha * switch take the Legendre form, and those above
+                # reach no panel below it, so the tree stops there.
+                if (
+                    slot[t] >= 0
+                    and k - 1 < tree_panels
+                    and (legendre_slot[t] < 0 or energy[k - 1] > alpha[t] * legendre_switch[t])
+                ):
                     moment_tree_add(
                         trees[slot[t]], size, energy, sigma, flux, moment_weights, k - 1
                     )
+                ls = legendre_slot[t]
+                if ls >= 0 and k - 1 < legendre_reach[t]:
+                    # Banded terms' sigma at k changed with the solve, so their panel is redone.
+                    if not own_ready[ls] or (jt >= 0 and banded):
+                        for q in range(n_moments):
+                            own_a[ls, q] = 0.0
+                            own_b[ls, q] = 0.0
+                        legendre_panel_moments(
+                            energy,
+                            sigma,
+                            k - 1,
+                            widths[k - 1],
+                            energy[k - 1],
+                            energy[k],
+                            2.0 * alpha[t] / (1.0 - alpha[t]) * energy[current_start[ls]],
+                            -(1.0 + alpha[t]) / (1.0 - alpha[t]),
+                            legendre_b,
+                            tables[t],
+                            tables[t + 1],
+                            table_energy,
+                            own_a[ls],
+                            own_b[ls],
+                            scratch,
+                        )
+                    ring = (k - 1) % capacity
+                    for q in range(n_moments):
+                        value = flux[k - 1] * own_a[ls, q] + flux[k] * own_b[ls, q]
+                        stored[ls, ring, q] = value
+                        current[ls, q] += value
+                    own_ready[ls] = False
         for c in range(n_comb):
             f_before[c] = f_now[c]
     return flux, diagonal, restricted, shield
@@ -781,6 +1065,8 @@ def march(ops, removal, scatter, streaming, source, lagged, start=0, anisotropy=
         ops.angle.pdf,
         ops.angle.cutoff,
         ops.angle.peak,
+        ops.angle.legendre_b,
+        ops.angle.legendre_switch,
         ops.rate_weights,
         kernels.emission,
         kernels.hat,
@@ -891,7 +1177,7 @@ def solve_energy(
         scale = np.abs(restricted).max()
         if (
             kernels.values.shape[0] == 0
-            or np.abs(restricted - lagged).max() <= SWEEP_TOLERANCE * scale
+            or np.abs(restricted - lagged).max() <= ops.sweep_tolerance * scale
         ):
             return EnergySolution(flux, diagonal, count, applications, shield, emission=restricted)
         if block is None:
@@ -916,7 +1202,7 @@ def solve_energy(
         # sqrt(entries) would not, and the outer sweeps would never pass.
         # A relative stop as well keeps GMRES off its round-off floor; what it leaves is a smaller
         # right-hand side for the next sweep's block solve.
-        tolerance = 0.1 * SWEEP_TOLERANCE * scale
+        tolerance = 0.1 * ops.sweep_tolerance * scale
         change, used = solve(
             apply, rhs, atol=tolerance, rtol=BLOCK_RTOL, max_iterations=BLOCK_RESTARTS
         )

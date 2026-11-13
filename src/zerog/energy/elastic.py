@@ -57,10 +57,22 @@ class AngleKernels:
     pdf: np.ndarray
     cutoff: np.ndarray
     peak: np.ndarray  # largest pdf per table, at least 1
+    # The Legendre form (legendre_coefficients): per table, the coefficients b_n of (2 f - 1) as a
+    # polynomial in y = x - 1, n = 0 .. legendre_order; and per term, the energy at or below which
+    # every table is within its truncation tolerance (0 where the form is off).
+    legendre_b: np.ndarray = None
+    legendre_switch: np.ndarray = None
+    legendre_order: int = 0
 
 
-def compile_angle_tables(terms, tolerance=FLAT_TOLERANCE):
-    """Flatten a list of AngleTables, or None for an isotropic term, into AngleKernels."""
+def compile_angle_tables(terms, tolerance=FLAT_TOLERANCE, legendre=None):
+    """Flatten a list of AngleTables, or None for an isotropic term, into AngleKernels.
+
+    legendre, (order, tolerance) or None, adds the truncated Legendre form of every table
+    (legendre_coefficients); None leaves it off, so every window takes the exact form.
+    """
+    if legendre is not None and not 1 <= int(legendre[0]) <= LEGENDRE_MAX_ORDER:
+        raise ValueError(f"Legendre order must be 1 to {LEGENDRE_MAX_ORDER}, not {legendre[0]}")
     tables = [0]
     energies = []
     points = [0]
@@ -94,6 +106,17 @@ def compile_angle_tables(terms, tolerance=FLAT_TOLERANCE):
                 share = (tolerance - deviation[last + 1]) / (deviation[last] - deviation[last + 1])
                 cutoff[t] = lower + (upper - lower) * max(share, 0.0)
     empty = np.empty(0)
+    order = 0 if legendre is None else int(legendre[0])
+    n_tables = tables[-1]
+    b = np.zeros((n_tables, order + 1))
+    switch = np.zeros(len(terms))
+    if legendre is not None:
+        for t, angle in enumerate(terms):
+            if angle is None:
+                continue
+            coefficients, ok = legendre_coefficients(angle, order, legendre[1])
+            b[tables[t] : tables[t + 1]] = coefficients
+            switch[t] = legendre_switch(angle.energy, ok)
     return AngleKernels(
         tables=np.array(tables, dtype=np.int64),
         table_energy=np.concatenate(energies) if energies else empty,
@@ -102,7 +125,67 @@ def compile_angle_tables(terms, tolerance=FLAT_TOLERANCE):
         pdf=np.concatenate(pdfs) if pdfs else empty,
         cutoff=cutoff,
         peak=np.concatenate(peaks) if peaks else empty,
+        legendre_b=b,
+        legendre_switch=switch,
+        legendre_order=order,
     )
+
+
+def legendre_coefficients(angle, order, tolerance):
+    """Each table's (2 f - 1) truncated at Legendre order, as coefficients b_n of mu^n, and whether
+    the truncation is within tolerance of the table: the largest difference between their
+    cumulative distributions in mu.
+
+    f_L = sum_l (2l + 1) / 2 a_l P_l(mu), with a_l the table's exact moments (table_moments) and
+    a_0 taken as 1, so 2 f_L - 1 = sum_{l >= 1} (2l + 1) a_l P_l and it integrates to zero: the
+    truncated kernel moves no neutrons. Powers of mu about the middle of its range keep the
+    coefficients of P_l small, which the running moments' round-off needs (LEGENDRE_MAX_ORDER).
+
+    The cumulative difference bounds the error of the window integral against any F sigma of
+    bounded variation, which a pointwise bound on the pdf does not need to: a lin-lin table's
+    kinks keep a pointwise error near 1e-2 at any low order, though they move little.
+    """
+    n_tables = angle.energy.shape[0]
+    b = np.zeros((n_tables, order + 1))
+    ok = np.zeros(n_tables, dtype=bool)
+    grid = np.linspace(-1.0, 1.0, 2001)
+    p = np.zeros((order + 1, order + 1))  # p[l, n], P_l = sum_n p[l, n] mu^n
+    for degree in range(order + 1):
+        unit = np.zeros(degree + 1)
+        unit[degree] = 1.0
+        p[degree, : degree + 1] = np.polynomial.legendre.leg2poly(unit)
+    weights_l = (2 * np.arange(order + 1) + 1) / 2.0
+    for i in range(n_tables):
+        a = table_moments(angle, i, order + 1)
+        a = a / a[0]
+        mu = angle.mu[angle.offsets[i] : angle.offsets[i + 1]]
+        pdf = angle.pdf[angle.offsets[i] : angle.offsets[i + 1]]
+        pdf = pdf / np.trapezoid(pdf, mu)
+        points = np.union1d(grid, mu)
+        values = np.interp(points, mu, pdf)
+        exact = np.concatenate(
+            [[0.0], np.cumsum(0.5 * (values[1:] + values[:-1]) * np.diff(points))]
+        )
+        truncated = np.polynomial.legendre.legval(
+            points, np.polynomial.legendre.legint(weights_l * a, lbnd=-1.0)
+        )
+        ok[i] = np.abs(truncated - exact).max() <= tolerance
+        weights = (2 * np.arange(order + 1) + 1) * a
+        weights[0] = 0.0
+        b[i] = weights @ p
+    return b, ok
+
+
+def legendre_switch(table_energy, ok):
+    """The energy at or below which every table is ok: the mix between two ok tables is within
+    the same tolerance, and below the lowest table f is the lowest table's. table_energy runs high
+    to low; 0 if the lowest table is not ok, infinite if every table is."""
+    switch = 0.0
+    for i in range(table_energy.shape[0] - 1, -1, -1):
+        if not ok[i]:
+            return switch
+        switch = table_energy[i]
+    return np.inf
 
 
 @njit(cache=True)
@@ -958,3 +1041,240 @@ def thin_angle(angle, tolerance):
         pdf=np.concatenate(pdfs),
         cdf=np.concatenate(cdfs),
     )
+
+
+# The Legendre form of the anisotropic window. With f truncated at order L, (2 f - 1) / E' at node
+# energy E is sum_n b_n(E') x^n / E', x = c E / E' + d, and b_n linear in E' between table
+# energies, as the tables mix. For a block with top e, v = c alpha e / E' + d is the cosine seen
+# from the block's bottom, alpha e, which spans [-1, 1] over the block; then x = rho v + tau with
+# rho = E / (alpha e) and tau = d (1 - rho), and |rho v| + |tau| stays under (2 + alpha) / alpha
+# for every node whose window meets the block: about 3 for heavy targets, 3.6 for O16, but without
+# bound as alpha falls, so light targets (alpha below LEGENDRE_MIN_ALPHA) keep the exact form.
+# The window integral is sum_n sum_m C(n, m) rho^m tau^(n - m) N_nm, where N_nm is the integral
+# of sigma F b_n v^m / E' du.
+# The N_nm are running sums over panels, restarted per block as the isotropic recursion's are, so
+# a node costs O(L^2) however many table knots or energies its window holds.
+
+_GAUSS6_X = tuple(0.5 * (x + 1.0) for x in np.polynomial.legendre.leggauss(6)[0])
+_GAUSS6_W = tuple(0.5 * w for w in np.polynomial.legendre.leggauss(6)[1])
+LEGENDRE_SHORT_V = 0.05  # pieces this short in v, and in u, take three Gauss points, not six
+LEGENDRE_SHORT_U = 0.005
+
+
+@njit(inline="always")
+def _exp_minus_inline(s):
+    """_exp_minus, inlined: a call costs more than its series in the Legendre kernels."""
+    if 0.0 <= s < 0.01:
+        return 1.0 - s * (
+            1.0
+            - s
+            * (
+                0.5
+                - s
+                * (
+                    1.0 / 6.0
+                    - s * (1.0 / 24.0 - s * (1.0 / 120.0 - s * (1.0 / 720.0 - s / 5040.0)))
+                )
+            )
+        )
+    return math.exp(-s)
+
+
+LEGENDRE_PIECE_V = 0.25  # largest change of v per Gauss piece
+# Running moments reach a node through powers of rho v + tau up to 3 or 4, which multiply round-off
+# by about sum_n |p_Ln| 3^n: 4e5 at order 8, 7e6 at 10, so orders stop there.
+LEGENDRE_MAX_ORDER = 10
+LEGENDRE_MIN_ALPHA = 0.7  # (2 + alpha) / alpha under 4: carbon (0.716) and heavier
+LEGENDRE_PIECE_U = 0.02  # and of lethargy
+
+
+def legendre_size(order):
+    """Entries N_nm, 0 <= m <= n <= order, at n (n + 1) / 2 + m."""
+    return (order + 1) * (order + 2) // 2
+
+
+@njit(inline="always")
+def legendre_panel_moments(
+    energy,
+    sigma,
+    i,
+    h,
+    e_top,
+    e_bottom,
+    scale,
+    offset,
+    legendre_b,
+    low,
+    high,
+    table_energy,
+    out_a,
+    out_b,
+    work,
+):
+    """Add to out_a and out_b the N_nm of panel i, of width h in lethargy, from e_top down to
+    e_bottom, for F = F_i (1 - s / h) and F = F_(i+1) s / h per unit node value, with
+    v = scale / E' + offset.
+
+    Tables low .. high - 1 are the term's (legendre_b rows and table_energy, high to low). work
+    holds 6 (order + 1) scratch values. The part is split at table energies inside it, where b_n
+    has a kink, and each piece takes six Gauss points per stretch of v and u, which reach
+    round-off for its smooth integrand, or three on the short pieces most panels are, which leave
+    about 1e-9 of it: far inside the truncation's error, and conservation does not rest on them.
+    """
+    upper = energy[i]
+    last = high - 1
+    # The table interval holding e_top: a is the last table at or above it, low - 1 if none.
+    a = low - 1
+    z = high
+    while z - a > 1:
+        middle = (a + z) // 2
+        if table_energy[middle] >= e_top:
+            a = middle
+        else:
+            z = middle
+    piece_top = e_top
+    s_top = 0.0 if e_top >= upper else math.log(upper / e_top)
+    while True:
+        # a becomes the last table at or above the piece's top (past any repeated energies), and
+        # the next table, if above the part's bottom, ends the piece.
+        while a + 1 <= last and table_energy[a + 1] >= piece_top:
+            a += 1
+        following = a + 1
+        if following <= last and table_energy[following] > e_bottom:
+            piece_bottom = table_energy[following]
+        else:
+            piece_bottom = e_bottom
+        if piece_bottom < piece_top:
+            s_bottom = math.log(upper / piece_bottom)
+            _legendre_piece(
+                energy,
+                sigma,
+                i,
+                h,
+                s_top,
+                s_bottom,
+                piece_top,
+                piece_bottom,
+                scale,
+                offset,
+                legendre_b,
+                a,
+                low,
+                last,
+                table_energy,
+                out_a,
+                out_b,
+                work,
+            )
+            s_top = s_bottom
+        if piece_bottom <= e_bottom:
+            break
+        piece_top = piece_bottom
+
+
+@njit(inline="always")
+def _legendre_piece(
+    energy,
+    sigma,
+    i,
+    h,
+    s0,
+    s1,
+    e_top,
+    e_bottom,
+    scale,
+    offset,
+    legendre_b,
+    a,
+    low,
+    last,
+    table_energy,
+    out_a,
+    out_b,
+    work,
+):
+    """legendre_panel_moments on a piece inside one table interval, s0 to s1 below the panel's
+    top at energies e_top to e_bottom: table a above, a + 1 below (held at the ends when a is
+    before the first table or at the last).
+
+    b_n is linear in E' there, as the share of the lower table, so the points only sum v^m
+    weighted by each F basis and each table's share; the N_nm follow once per piece.
+    """
+    order = legendre_b.shape[1] - 1
+    size = order + 1
+    upper = energy[i]
+    lower = energy[i + 1]
+    span = 1.0 / (upper - lower)
+    dv = scale * (1.0 / e_bottom - 1.0 / e_top)
+    pieces = 1 + int(max(dv / LEGENDRE_PIECE_V, (s1 - s0) / LEGENDRE_PIECE_U))
+    step = (s1 - s0) / pieces
+    held = a < low or a >= last
+    row = low if a < low else (last if a >= last else a)
+    # work[2 size:6 size]: sums of v^m for (F_i, upper table), (F_i, lower), (F_i+1, upper), ...
+    for m in range(4 * size):
+        work[2 * size + m] = 0.0
+    inverse_span = 0.0 if held else 1.0 / (table_energy[a] - table_energy[a + 1])
+    inverse_h = 1.0 / h
+    start = e_top
+    short = dv <= LEGENDRE_SHORT_V * pieces and step <= LEGENDRE_SHORT_U
+    n_points = 3 if short else 6
+    for p in range(pieces):
+        if p > 0:
+            start = e_top * _exp_minus_inline(p * step)
+        for q in range(n_points):
+            if short:
+                t = _GAUSS3_X[q] * step
+                gauss_w = _GAUSS3_W[q]
+            else:
+                t = _GAUSS6_X[q] * step
+                gauss_w = _GAUSS6_W[q]
+            s = s0 + p * step + t
+            e = start * _exp_minus_inline(t)
+            inverse = 1.0 / e
+            g = (upper - e) * span
+            r = s * inverse_h
+            weight = gauss_w * step * ((1.0 - g) * sigma[i] + g * sigma[i + 1]) * inverse
+            v = scale * inverse + offset
+            share = 0.0 if held else (table_energy[a] - e) * inverse_span
+            w_a = weight * (1.0 - r)
+            w_b = weight * r
+            x0 = w_a * (1.0 - share)
+            x1 = w_a * share
+            x2 = w_b * (1.0 - share)
+            x3 = w_b * share
+            power = 1.0
+            for m in range(size):
+                work[2 * size + m] += x0 * power
+                work[3 * size + m] += x1 * power
+                work[4 * size + m] += x2 * power
+                work[5 * size + m] += x3 * power
+                power *= v
+    upper_row = row
+    lower_row = row if held else a + 1
+    index = 0
+    for n in range(size):
+        bu = legendre_b[upper_row, n]
+        bl = legendre_b[lower_row, n]
+        for m in range(n + 1):
+            out_a[index] += bu * work[2 * size + m] + bl * work[3 * size + m]
+            out_b[index] += bu * work[4 * size + m] + bl * work[5 * size + m]
+            index += 1
+
+
+@njit(inline="always")
+def legendre_combine(moments, rho, tau, order, binomial, work):
+    """sum_n sum_m C(n, m) rho^m tau^(n - m) N_nm. work holds 2 (order + 1) scratch values."""
+    r = 1.0
+    t = 1.0
+    for m in range(order + 1):
+        work[m] = r
+        work[order + 1 + m] = t
+        r *= rho
+        t *= tau
+    total = 0.0
+    index = 0
+    for n in range(order + 1):
+        for m in range(n + 1):
+            total += binomial[n, m] * work[m] * work[order + 1 + n - m] * moments[index]
+            index += 1
+    return total

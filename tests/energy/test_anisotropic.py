@@ -560,3 +560,97 @@ def test_thinned_angle_tables_stay_within_tolerance_and_normalized(name):
         # Within the tolerance, plus what renormalizing moved: at most twice it, times the pdf.
         back = np.interp(mu, t_mu, t_pdf)
         assert np.abs(back - pdf).max() <= tolerance + 2.5 * tolerance * pdf.max() + 1e-9
+
+
+@pytest.mark.parametrize("awr", [11.9, 55.4, 236.0])
+def test_legendre_form_is_exact_where_the_tables_are_polynomials(awr):
+    # Linear pdfs are their own order-1 expansions, and the mix between tables is linear in E' in
+    # both forms, so the Legendre windows must reproduce the exact ones to round-off: across
+    # several blocks, with a table energy inside a panel and the window reaching the grid's top.
+    alpha = kinematic_alpha(awr)
+    width = -np.log(alpha)
+    middle = TOP * np.exp(-1.5 * width)
+    shapes = [
+        ([-1.0, 1.0], [0.6, 1.4]),
+        ([-1.0, 0.0, 1.0], [0.8, 1.0, 1.2]),
+        ([-1.0, 1.0], [1.1, 0.9]),
+    ]
+    mus, pdfs = [], []
+    for mu, pdf in shapes:
+        mus.append(np.array(mu))
+        pdfs.append(np.array(pdf) / np.trapezoid(pdf, mu))
+    table = AngleTables(
+        energy=np.array([2.0e7, middle, 1.0e-5]),
+        offsets=np.concatenate([[0], np.cumsum([m.shape[0] for m in mus])]),
+        interpolation=np.full(3, 2, dtype=np.int64),
+        mu=np.concatenate(mus),
+        pdf=np.concatenate(pdfs),
+        cdf=np.zeros(sum(m.shape[0] for m in mus)),
+    )
+    n = 600
+    energy = TOP * np.exp(-np.linspace(0.0, 6.0 * width, n))
+    assert not np.any(np.isclose(energy, middle, rtol=1e-6))
+    sigma = (1.0 + 0.4 * np.sin(np.arange(n) * 0.05))[None, :]
+    source = np.exp(-np.arange(n) / 50.0)
+    exact = build_operators(energy, sigma + 0.2, sigma, [alpha], [table])
+    legendre = build_operators(energy, sigma + 0.2, sigma, [alpha], [table], legendre=(2, 1e-9))
+    assert legendre.angle.legendre_switch[0] == np.inf
+    f_exact = solve_energy(exact, [1.0], [[0.8]], 0.1, source).flux
+    f_legendre = solve_energy(legendre, [1.0], [[0.8]], 0.1, source).flux
+    np.testing.assert_allclose(f_legendre, f_exact, rtol=1e-13)
+
+
+def test_legendre_coefficients_conserve_and_flag_tables_by_truncation_error():
+    from zerog.energy.elastic import legendre_coefficients, legendre_switch
+
+    # A linear table is exact at order 1; a forward peak is not, at any low order.
+    table = AngleTables(
+        energy=np.array([2.0e7, 1.0e6, 1.0e3]),
+        offsets=np.array([0, 4, 6, 8]),
+        interpolation=np.full(3, 2, dtype=np.int64),
+        mu=np.array([-1.0, 0.8, 0.98, 1.0, -1.0, 1.0, -1.0, 1.0]),
+        pdf=np.concatenate(
+            [
+                np.array([0.05, 0.1, 2.0, 40.0])
+                / np.trapezoid([0.05, 0.1, 2.0, 40.0], [-1, 0.8, 0.98, 1]),
+                [0.4, 0.6],
+                [0.5, 0.5],
+            ]
+        ),
+        cdf=np.zeros(8),
+    )
+    b, ok = legendre_coefficients(table, 4, 1e-6)
+    np.testing.assert_array_equal(ok, [False, True, True])
+    assert legendre_switch(table.energy, ok) == 1.0e6
+    # 2 f - 1 = 0.2 mu for the linear table, and zero for the flat one.
+    np.testing.assert_allclose(b[1], [0.0, 0.2, 0, 0, 0], atol=1e-14)
+    np.testing.assert_allclose(b[2], 0.0, atol=1e-14)
+    # Every truncation integrates to zero over mu, so it moves no neutrons.
+    integrals = np.array([(1.0 - (-1.0) ** (n + 1)) / (n + 1) for n in range(5)])
+    np.testing.assert_allclose(b @ integrals, 0.0, atol=1e-12)
+
+
+def test_light_targets_keep_the_exact_form():
+    # A window as wide as the grid would put rho near 1 / alpha into the running moments' powers,
+    # so targets lighter than LEGENDRE_MIN_ALPHA (hydrogen's alpha is 2e-7, not 0) march exactly.
+    from zerog.energy.elastic import LEGENDRE_MIN_ALPHA
+
+    table = tables_from(*LINEAR)
+    energy = TOP * np.exp(-np.linspace(0.0, 4.0, 200))
+    sigma = np.ones((2, 200))
+    alphas = [1.7e-7, kinematic_alpha(11.9)]
+    assert alphas[0] < LEGENDRE_MIN_ALPHA < alphas[1]
+    source = np.exp(-np.arange(200) / 20.0)
+    d = np.array([0.5, 0.5])
+    flux = {
+        legendre: solve_energy(
+            build_operators(energy, 1.2 * sigma, sigma, alphas, [table, table], legendre=legendre),
+            d,
+            d[:, None],
+            0.1,
+            source,
+        ).flux
+        for legendre in (None, (2, 1.0))
+    }
+    assert np.all(np.isfinite(flux[(2, 1.0)]))
+    np.testing.assert_allclose(flux[(2, 1.0)], flux[None], rtol=1e-13)

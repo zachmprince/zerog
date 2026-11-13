@@ -1,6 +1,6 @@
 # Study 08: where the energy solver's time goes, and what exact changes recover
 
-Status: in progress (Phase 1.5, the speed work after decision 012).
+Status: done for the energy march (Phase 1.5, the speed work after decision 012).
 
 ## Question
 
@@ -105,3 +105,86 @@ The march, which is what the speed gate measures, improved by only 5 to 15%:
 What the remaining exact work could still do: precomputed piece tables and cached knot pointers
 (about 10%, measured), and a sliding aggregate in place of the tree query (perhaps 1.3 to 1.5
 times, unmeasured).
+
+## Part 2: the Legendre form, an approximation with an error budget
+
+### Question
+
+Once the exact form is set aside, how much faster can the anisotropic window get, and at what
+error against the exact path?
+
+### Method
+
+`subproblem.build_operators(..., legendre=(order, tolerance))`, also `build_mix(legendre=...)`.
+
+- **The form.** Each centre-of-mass table is truncated at Legendre order L. Between tables it
+  stays linear in E', as the tables mix.
+- **What a node costs.** (2 f - 1) / E' is then a polynomial in the cosine x = c E / E' + d, so a
+  window is a sum of O(L^2) running moments, N_nm = ∫ σF b_n v^m / E' du.
+  - The moments restart per block of one window width, as the isotropic recursion's sums do.
+  - Each block's variable is the cosine seen from its bottom, v, so x = ρ v + τ.
+  - A node costs two panel evaluations and three combinations, however many knots or table
+    energies its window holds.
+- **Exact properties.** Truncation keeps a_0 = 1, so the kernel still moves no neutrons. Tables
+  that are polynomials in μ (to order L) reproduce the exact path to round-off (tested).
+- **Where it applies.** Windows wholly below a nuclide's switch energy take the form: the highest
+  table energy under which every table's cumulative distribution in μ is within the tolerance of
+  its truncation. Above the switch, and for targets lighter than α = 0.7, the exact form stays.
+- **Budget, against the exact path on the same grid:**
+  - k within 1 pcm;
+  - every nuclide's elastic, capture and fission rate within 1e-4;
+  - F in bins of 1/20 lethargy within 1e-4, for bins holding more than 1e-6 of the largest.
+
+Choices made on the way:
+
+- **Cumulative tolerance, not pointwise.** A pointwise bound on the pdf kept the form below about
+  200 keV at any order. Lin-lin tables have kinks no polynomial follows, though they move little.
+- **Moments centred on the cosine (powers of μ, not of μ − 1).** About μ = 1, round-off grew by
+  P_8(5), about 2e7. The march then carried noise near 1e-12 of F, and the 1e-12 sweep test took
+  18 to 22 sweeps.
+  - Centred on the cosine, the growth is about 4e5.
+  - The form's sweeps stop at 1e-10, still six orders under its truncation error.
+  - Orders stop at 10.
+- **Light targets keep the exact form.** Hydrogen's α is 1.7e-7, not 0, and the map's ρ then
+  reached 1/α. The first PWR run produced NaN.
+
+### Result
+
+On study 03's mixes at 1% (code at this commit; "exact" is the default path after part 1):
+
+| Case | Form | March | Fixed-source solve | k solve | k − exact | Worst rate | Worst bin | Worst node |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| SFR | exact | 41 s | 142 s, 4 sweeps | 226 s, 6 | | | | |
+| SFR | L 8, 1e-3 | 23.1 s | 92.6 s | 127 s | +0.002 pcm | 9e-7 | 1.0e-5 | 1.4e-4 |
+| SFR | L 8, 1e-2 | 17.9 s | 71.8 s | 100 s | -6e-5 pcm | 9e-7 | 7.7e-5 | 5.7e-4 |
+| SFR | L 8, everywhere | 4.0 s | 16.1 s | 30.4 s | -0.003 pcm | 9e-7 | 5.7e-5 | 3.6e-2 |
+| PWR | exact | 9.4 s | 90 s, 6 + 55 block | 106 s | | | | |
+| PWR | L 8, 1e-2 | 6.8 s | 68.0 s | 77 s | +9e-4 pcm | 2e-7 | 6.3e-5 | 3.9e-4 |
+| PWR | L 8, everywhere | 2.6 s | 48.5 s, 5 + 44 block | 61 s | +5e-4 pcm | 2e-7 | 6.4e-5 | 3.8e-2 |
+
+"Everywhere" is a tolerance of 1, which every table meets, so no window keeps the exact form.
+
+- **Every setting meets the budget.**
+  - k moves by under 0.01 pcm and rates by under 1e-6.
+  - The worst bin is 6e-5 to 8e-5, always between 18 and 20 MeV.
+- **The pointwise error.** At L = 8 everywhere it is a ripple from truncated forward peaks, within
+  4% above 10 MeV, where 4e-4 of the flux lies. It is under 7e-4 below 10 MeV and under 7e-5
+  below 1 MeV.
+- **Where the exact form remains.** With a switch, the actinides' forward peaks keep it above 3 to
+  5 MeV, which no order up to 10 meets at these tolerances. The SFR grid has 50,000 nodes above
+  5 MeV, so that is most of what is left of the march.
+- **Per node,** on a 495k-node lethargy grid: 1.1 to 1.5 µs per nuclide, against 10 to 16 µs
+  exact.
+
+### Decision (part 2)
+
+- **Recommended setting: `legendre=(8, 1.0)`,** the form everywhere it applies.
+  - It meets the budget with a margin of 1.6 on the worst bin.
+  - It makes the SFR's march 10 times faster and its fixed-source solve 11 times.
+- **The exact form stays the default** and the oracle.
+- **What remains of the gate.** At 500k nodes the SFR's fixed-source solve would take about 33 s
+  over its 4 sweeps. Of a 4.0 s march, anisotropy is now 2.1 s, and the isotropic recursion (1.2)
+  and inelastic transfer (0.8) the rest, so no single part closes the gap. For the PWR, most of
+  the solve is the thermal block's GMRES marches.
+- **Not yet run with the form:** probability tables (study 05's 64-band case) and orders above
+  zero.
